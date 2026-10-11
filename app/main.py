@@ -207,7 +207,11 @@ def create_app(settings: Settings | None = None, *, runtime: Runtime | None = No
             {
                 "status": "ok" if ready else "degraded",
                 "detail": None if ready else "census catalog not loaded",
-                "proxy": {"forwarded_for_entries": len(xff), "client_ip_headers": client_ip_headers},
+                "proxy": {
+                    "forwarded_for_entries": len(xff),
+                    "client_ip_headers": client_ip_headers,
+                    "trusted_proxy_hops": settings.trusted_proxy_hops,
+                },
             }
         )
 

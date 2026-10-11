@@ -22,6 +22,10 @@ services:
         value: US_OPEN_CENSUS_DATA_NEIGHBORHOOD_INSIGHTS_FREE_DATASET
       - key: CENSUS_YEARS
         value: "2019,2020"
+      # Measured on Render via /healthz: Cloudflare and Render's load balancer each append to
+      # X-Forwarded-For, so the visitor's IP is the 2nd entry from the right.
+      - key: TRUSTED_PROXY_HOPS
+        value: "2"
       - key: BASIC_AUTH_USER
         value: reviewer
       - key: BASIC_AUTH_PASSWORD
