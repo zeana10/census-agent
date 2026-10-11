@@ -20,6 +20,8 @@ services:
         value: CENSUS_WH
       - key: SNOWFLAKE_DATABASE
         value: US_OPEN_CENSUS_DATA_NEIGHBORHOOD_INSIGHTS_FREE_DATASET
+      - key: CENSUS_YEARS
+        value: "2019,2020"
       - key: BASIC_AUTH_USER
         value: reviewer
       - key: BASIC_AUTH_PASSWORD
