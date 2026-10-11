@@ -1,0 +1,16 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+*.p8
+*.pem
+rsa_key*
+catalog_cache.json
+evals/results-*.json
+.pytest_cache/
+snowflake_setup_ready.sql
+fix_app_key.sql
+.idea/
+.DS_Store
+.ruff_cache/
+.mypy_cache/

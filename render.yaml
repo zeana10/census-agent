@@ -1,0 +1,26 @@
+# Render Blueprint: New > Blueprint > point at this repo. Fill the secret env vars in the dashboard.
+services:
+  - type: web
+    name: census-assistant
+    runtime: docker
+    plan: starter          # free plan sleeps after inactivity; starter stays warm for reviewers
+    healthCheckPath: /healthz
+    envVars:
+      - key: ANTHROPIC_API_KEY
+        sync: false
+      - key: SNOWFLAKE_ACCOUNT
+        sync: false
+      - key: SNOWFLAKE_USER
+        value: CENSUS_APP
+      - key: SNOWFLAKE_PRIVATE_KEY_PEM
+        sync: false
+      - key: SNOWFLAKE_ROLE
+        value: CENSUS_READER
+      - key: SNOWFLAKE_WAREHOUSE
+        value: CENSUS_WH
+      - key: SNOWFLAKE_DATABASE
+        value: US_OPEN_CENSUS_DATA_NEIGHBORHOOD_INSIGHTS_FREE_DATASET
+      - key: BASIC_AUTH_USER
+        value: reviewer
+      - key: BASIC_AUTH_PASSWORD
+        sync: false

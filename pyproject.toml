@@ -1,0 +1,64 @@
+[project]
+name = "census-agent"
+version = "0.1.0"
+description = "Chat agent answering US population questions from the Snowflake Marketplace Open Census data"
+readme = "README.md"
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "anthropic>=1.13,<2",
+    "fastapi>=0.143,<1",
+    "uvicorn[standard]>=0.54,<1",
+    "pydantic>=2.14,<3",
+    "pydantic-settings>=2.15,<3",
+    "snowflake-connector-python>=4.8,<5",
+    "sqlglot>=30.22,<31",
+    "rapidfuzz>=3.14,<4",
+    "pyyaml>=6.0,<7",
+]
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1,<10",
+    "pytest-asyncio>=1.4,<2",
+    "httpx>=0.28,<1",
+    "duckdb>=1.5,<2",
+    "ruff>=0.17,<0.18",
+    "mypy>=2.4,<3",
+    "types-PyYAML",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+asyncio_mode = "strict"
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 130
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "ASYNC", "S", "RUF"]
+ignore = [
+    "S608",    # SQL built from strings: intentional, every model-written query goes through sql_guard
+    "RUF001",  # typographic quotes/ellipses in user-facing status text are deliberate
+    "B008",    # FastAPI Depends() in defaults is the framework idiom
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["S101", "S105", "S106", "E501", "RUF012"]  # long fixture rows are clearer unwrapped
+"evals/**" = ["S101"]
+
+[tool.mypy]
+python_version = "3.11"
+packages = ["app"]
+strict_optional = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+check_untyped_defs = true
+disallow_incomplete_defs = true
+
+[[tool.mypy.overrides]]
+module = ["snowflake.*", "rapidfuzz.*", "duckdb.*", "cryptography.*"]
+ignore_missing_imports = true

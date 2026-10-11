@@ -1,0 +1,48 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install uv
+        run: pip install uv==0.13.0
+      - name: Install locked dependencies
+        run: uv sync --frozen
+      - name: Lint
+        run: uv run ruff check app tests evals scripts
+      - name: Format
+        run: uv run ruff format --check app tests evals scripts
+      - name: Type check
+        run: uv run mypy
+      - name: Tests (offline; no credentials needed)
+        run: uv run pytest -q
+
+  docker:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t census-agent:ci .
+      - name: Boot smoke test (no credentials, expect degraded mode)
+        run: |
+          docker run -d --name app -p 8000:8000 -e SNOWFLAKE_ACCOUNT=invalid census-agent:ci
+          for i in $(seq 1 30); do
+            if curl -fsS localhost:8000/healthz; then break; fi
+            sleep 2
+          done
+          curl -fsS localhost:8000/healthz | grep -q '"status"'
+          docker logs app | tail -20
