@@ -25,9 +25,11 @@ def test_decoy_and_redistricting_tables_are_excluded(catalog):
 
 
 def test_latest_release_wins_titles_and_labels(catalog):
-    assert "2020" in catalog.tables["B19013"].title
     assert catalog.fields["B19013e1"].label.startswith("Median household income")
-    assert "2020 inflation-adjusted" in catalog.fields["B19013e1"].label
+    # With several releases, labels must not claim one release's dollars for all of them.
+    assert "release-year inflation-adjusted dollars" in catalog.fields["B19013e1"].label
+    assert "2020 inflation-adjusted" not in catalog.fields["B19013e1"].label
+    assert "release-year" in catalog.tables["B19013"].title
 
 
 def test_fields_and_tables_present_in_one_release_only(catalog):
@@ -82,6 +84,25 @@ def test_cache_is_rebuilt_when_configured_years_change(tmp_path, warehouse, cata
     path.write_text(catalog.to_json())
     only_2019 = load_or_build(warehouse, cache_path=str(path), database=DB, schema=SCHEMA, years=["2019"])
     assert only_2019.years == ["2019"] and "2020_CBG_B01" not in only_2019.allowed_tables
+
+
+def test_cache_from_older_catalog_version_is_rebuilt(tmp_path, warehouse, catalog):
+    import json
+
+    path = tmp_path / "c.json"
+    d = json.loads(catalog.to_json())
+    d["version"] = 1
+    d["fields"]["B19013e1"]["label"] = "STALE"
+    path.write_text(json.dumps(d))
+    fresh = load_or_build(warehouse, cache_path=str(path), database=DB, schema=SCHEMA, years=YEARS)
+    assert fresh.fields["B19013e1"].label != "STALE"
+
+
+def test_single_release_keeps_its_own_dollar_year(warehouse):
+    from app.catalog import build_catalog
+
+    only_2019 = build_catalog(warehouse, database=DB, schema=SCHEMA, years=["2019"])
+    assert "2019 inflation-adjusted" in only_2019.fields["B19013e1"].label
 
 
 def test_old_format_cache_is_ignored(tmp_path, warehouse):

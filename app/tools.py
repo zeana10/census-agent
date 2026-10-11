@@ -76,6 +76,15 @@ TOOL_DEFS: list[dict] = [
                 "type": "string",
                 "description": "One short phrase describing what this query computes, shown to the user.",
             },
+            "show_table": {
+                "type": "boolean",
+                "description": (
+                    "Set true when the answer is a list or ranking of more than about 10 rows (e.g. every state or "
+                    "county). The app then shows the FULL result to the user as a table under your answer, with Excel "
+                    "and CSV download, so you write only a short summary and never retype the rows. Give columns "
+                    "readable aliases and an ORDER BY."
+                ),
+            },
         },
         ["sql", "purpose"],
     ),
@@ -91,11 +100,14 @@ class ToolOutput:
 
 
 class ToolExecutor:
-    def __init__(self, catalog: Catalog, geography: Geography, warehouse: Warehouse, *, max_rows: int):
+    def __init__(
+        self, catalog: Catalog, geography: Geography, warehouse: Warehouse, *, max_rows: int, table_max_rows: int = 10_000
+    ):
         self.catalog = catalog
         self.geo = geography
         self.wh = warehouse
-        self.max_rows = max_rows
+        self.max_rows = max_rows  # what the model sees
+        self.table_max_rows = max(table_max_rows, max_rows)  # what a user-facing table can hold
 
     async def run(self, name: str, args: Any) -> ToolOutput:
         if not isinstance(args, dict):
@@ -108,7 +120,7 @@ class ToolExecutor:
             if name == "resolve_geography":
                 return self._resolve_geography(_str(args, "place"))
             if name == "run_sql":
-                return await self._run_sql(_str(args, "sql"), str(args.get("purpose", "")))
+                return await self._run_sql(_str(args, "sql"), str(args.get("purpose", "")), args.get("show_table") is True)
             return ToolOutput(json.dumps({"error": f"Unknown tool {name!r}."}), is_error=True)
         except _BadArgs as e:
             return ToolOutput(json.dumps({"error": str(e)}), is_error=True)
@@ -172,14 +184,15 @@ class ToolExecutor:
             payload["note"] = f"{len(matches)} candidates; ask the user which one they mean unless context makes it clear."
         return ToolOutput(json.dumps(payload))
 
-    async def _run_sql(self, sql: str, purpose: str) -> ToolOutput:
+    async def _run_sql(self, sql: str, purpose: str, show_table: bool = False) -> ToolOutput:
+        limit = self.table_max_rows if show_table else self.max_rows
         try:
             v = validate(
                 sql,
                 allowed_tables=self.catalog.allowed_tables,
                 database=self.catalog.database,
                 schema=self.catalog.schema,
-                max_rows=self.max_rows,
+                max_rows=limit,
             )
         except SqlRejected as e:
             return ToolOutput(
@@ -188,7 +201,7 @@ class ToolExecutor:
                 meta={"sql": sql, "purpose": purpose, "rejected": True},
             )
         try:
-            res = await self.wh.query(v.sql, max_rows=self.max_rows)
+            res = await self.wh.query(v.sql, max_rows=limit)
         except WarehouseUnavailable:
             raise
         except WarehouseError as e:
@@ -198,15 +211,42 @@ class ToolExecutor:
                 meta={"sql": v.display_sql, "purpose": purpose, "capped": v.capped},
             )
         log.info("sql ok", extra={"sql": v.sql, "rows": len(res.rows), "ms": res.elapsed_ms, "truncated": res.truncated})
-        payload: dict[str, Any] = {"columns": res.columns, "rows": res.rows, "row_count": len(res.rows)}
-        if res.truncated:
-            payload["note"] = f"Result truncated to {self.max_rows} rows. Aggregate further if you need the full picture."
+        model_rows, shown = _model_view(res.rows, self.max_rows)
+        payload: dict[str, Any] = {"columns": res.columns, "rows": model_rows, "row_count": len(res.rows)}
+        meta: dict[str, Any] = {
+            "sql": v.display_sql,
+            "purpose": purpose,
+            "rows": len(res.rows),
+            "ms": res.elapsed_ms,
+            "capped": v.capped,
+        }
         if not res.rows:
             payload["note"] = "Query returned no rows. Check the geography filter and field names."
-        return ToolOutput(
-            json.dumps(payload, default=str),
-            meta={"sql": v.display_sql, "purpose": purpose, "rows": len(res.rows), "ms": res.elapsed_ms, "capped": v.capped},
-        )
+        elif show_table:
+            meta["table"] = {"columns": res.columns, "rows": res.rows, "truncated": res.truncated}
+            more = f" (the query returned more; the table holds the first {limit:,})" if res.truncated else ""
+            payload["note"] = (
+                f"The user sees all {len(res.rows):,} rows{more} as a table under your answer, with Excel and CSV "
+                f"download. You see {shown}. Summarize the table; do not reproduce its rows."
+            )
+        elif res.truncated or len(res.rows) > len(model_rows):
+            payload["note"] = (
+                f"Result truncated: you see {shown}. Aggregate further, or set show_table=true so the user gets the "
+                "full result as a table."
+            )
+        return ToolOutput(json.dumps(payload, default=str), meta=meta)
+
+
+def _model_view(rows: list[list[Any]], cap: int) -> tuple[list[list[Any]], str]:
+    """The rows the model gets: all of them if they fit, else the head and the tail of an ordered result,
+    so it can still describe both ends (largest and smallest)."""
+    if len(rows) <= cap:
+        return rows, f"all {len(rows):,} rows"
+    tail = min(20, cap // 10)
+    if tail == 0:  # tiny caps: rows[-0:] would be *every* row
+        return rows[:cap], f"the first {cap} of {len(rows):,} rows"
+    head = cap - tail
+    return rows[:head] + rows[-tail:], f"the first {head} and last {tail} of {len(rows):,} rows"
 
 
 class _BadArgs(ValueError):

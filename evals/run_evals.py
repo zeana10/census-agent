@@ -32,8 +32,12 @@ def _numbers(text: str) -> list[float]:
     ]
 
 
-def check(case: dict, answer: str, stats, target: float | None = None) -> list[str]:
+def check(case: dict, answer: str, stats, target: float | None = None, tables: list[dict] | None = None) -> list[str]:
     fails = []
+    if case.get("expect_table_rows") is not None:
+        rows = max((len(t["rows"]) for t in tables or []), default=0)
+        if rows < case["expect_table_rows"]:
+            fails.append(f"expected a table with >= {case['expect_table_rows']} rows, got {rows}")
     low = answer.lower()
     if case.get("expect_outcome") and stats.outcome not in case["expect_outcome"]:
         fails.append(f"outcome {stats.outcome} not in {case['expect_outcome']}")
@@ -73,8 +77,11 @@ async def main(filter_: str | None) -> int:
         for q in case["turns"]:
             t0 = time.monotonic()
             chunks: list[str] = []
+            tables: list[dict] = []
 
-            async def emit(ev, data, chunks=chunks):
+            async def emit(ev, data, chunks=chunks, tables=tables):
+                if ev == "table":
+                    tables.append(data)
                 if ev == "delta":
                     chunks.append(data["text"])
                 elif ev in ("reset", "replace"):
@@ -86,7 +93,7 @@ async def main(filter_: str | None) -> int:
             answer = "".join(chunks)
             slowest = max(slowest, time.monotonic() - t0)
         elapsed = slowest  # the 60 s requirement is per turn
-        fails = check(case, answer, stats, target)
+        fails = check(case, answer, stats, target, tables)
         if elapsed > 60:
             fails.append(f"too slow: {elapsed:.1f}s")
         passed += not fails

@@ -12,9 +12,24 @@ so a long conversation hits a turn limit and the user starts a new chat.
 from __future__ import annotations
 
 import asyncio
+import secrets
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
+from typing import Any
+
+
+@dataclass
+class ResultTable:
+    """A full query result the user can see and download (the model only sees a capped view)."""
+
+    purpose: str
+    sql: str
+    columns: list[str]
+    rows: list[list[Any]]
+    truncated: bool  # True when the result had more than table_max_rows rows
+    created: float = field(default_factory=time.time)
 
 
 @dataclass
@@ -26,6 +41,15 @@ class Session:
     transcript: list[tuple[str, str]] = field(default_factory=list)
     last_used: float = field(default_factory=time.monotonic)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    tables: OrderedDict[str, ResultTable] = field(default_factory=OrderedDict)
+
+    def add_table(self, table: ResultTable, *, keep: int) -> str:
+        """Store a table and return its unguessable id; only the newest `keep` tables are kept."""
+        table_id = secrets.token_urlsafe(12)
+        self.tables[table_id] = table
+        while len(self.tables) > keep:
+            self.tables.popitem(last=False)
+        return table_id
 
     @property
     def user_turns(self) -> int:
@@ -52,6 +76,10 @@ class SessionStore:
         sid = session_id if session_id is not None and _valid_id(session_id) else uuid.uuid4().hex
         s = self._sessions[sid] = Session(id=sid)
         return s
+
+    def get(self, session_id: str) -> Session | None:
+        """An existing session, without creating one (for downloads)."""
+        return self._sessions.get(session_id)
 
     def reset(self, session_id: str) -> None:
         self._sessions.pop(session_id, None)

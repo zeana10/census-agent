@@ -19,7 +19,7 @@ from typing import Any
 from . import guardrails
 from .config import Settings
 from .llm import LLM, LLMError, ToolCall, Turn
-from .sessions import Session
+from .sessions import ResultTable, Session
 from .tools import TOOL_DEFS, ToolExecutor, ToolOutput
 from .warehouse import WarehouseUnavailable
 
@@ -107,6 +107,7 @@ class Agent:
         queried_this_turn = False
         turn_results: list[str] = []  # successful tool results this turn, for the verifier
         streamed: list[str] = []  # text streamed in the current model step, kept if the deadline hits
+        tables_shown: list[str] = []  # one-line descriptions of tables shown to the user this turn
         last_table: dict | None = None  # most recent successful query result, the fallback answer
 
         async def on_text(t: str) -> None:
@@ -143,7 +144,7 @@ class Agent:
                 if turn.stop_reason == "tool_use" and turn.tool_calls and not wrap_up_sent:
                     if turn.text.strip():
                         await emit("reset", {})  # pre-tool narration isn't the answer
-                    results = await self._run_tools(turn, emit, stats)
+                    results = await self._run_tools(turn, emit, stats, session, tables_shown)
                     # Every successful tool result is evidence: query rows, but also e.g. how many
                     # places a name matched (a live eval caught the verifier flagging that as unsupported).
                     for c, r in zip(turn.tool_calls, results, strict=True):
@@ -220,7 +221,7 @@ class Agent:
             if not final_text:
                 final_text = "I wasn't able to produce an answer for that. Could you rephrase or narrow the question?"
                 await emit("replace", {"text": final_text})
-            session.commit(messages, question, final_text)
+            session.commit(messages, question, _with_table_notes(final_text, tables_shown))
 
         except asyncio.CancelledError:
             # The user pressed Stop or closed the tab. Nothing was committed, so the
@@ -233,7 +234,7 @@ class Agent:
         except TimeoutError:
             # Degrade instead of discarding work: keep a substantial partial answer, or show
             # the data we already fetched. Only apologise if there's nothing to show.
-            fallback = _timeout_fallback("".join(streamed).strip(), last_table)
+            fallback = _timeout_fallback("".join(streamed).strip(), last_table, table_shown=bool(tables_shown))
             if fallback is None:
                 stats.outcome = "timeout"
                 await self._fail(session, question, MSG_TIMEOUT, emit)
@@ -273,7 +274,7 @@ class Agent:
         return stats
 
     # ------------------------------------------------------------------------
-    async def _run_tools(self, turn: Turn, emit: Emit, stats: TurnStats) -> list[ToolOutput]:
+    async def _run_tools(self, turn: Turn, emit: Emit, stats: TurnStats, session: Session, tables: list[str]) -> list[ToolOutput]:
         for c in turn.tool_calls:
             await emit("status", {"text": _status_for(c.name, c.input)})
 
@@ -296,6 +297,9 @@ class Agent:
                             "capped": out.meta.get("capped", False),
                         },
                     )
+                table = out.meta.get("table")
+                if table and not out.is_error:
+                    await self._show_table(session, out.meta, table, emit, tables)
             return out
 
         results = await asyncio.gather(*(one(c) for c in turn.tool_calls), return_exceptions=True)
@@ -350,6 +354,31 @@ class Agent:
         claims = "; ".join(verdict.unsupported_claims[:5]) or verdict.reason
         return f"claims the query results don't support ({claims})"
 
+    async def _show_table(self, session: Session, meta: dict, table: dict, emit: Emit, tables: list[str]) -> None:
+        """Store the full result for download and send it to the browser. The rows come straight from
+        Snowflake, so a large table is never retyped (and possibly mistyped) by the model."""
+        rt = ResultTable(
+            purpose=meta.get("purpose", ""),
+            sql=meta.get("sql", ""),
+            columns=table["columns"],
+            rows=table["rows"],
+            truncated=table["truncated"],
+        )
+        table_id = session.add_table(rt, keep=self.s.tables_per_session)
+        tables.append(f"{rt.purpose or 'Query result'}: {len(rt.rows):,} rows")
+        await emit(
+            "table",
+            {
+                "id": table_id,
+                "session_id": session.id,
+                "purpose": rt.purpose,
+                "columns": rt.columns,
+                "rows": rt.rows,
+                "truncated": rt.truncated,
+                "max_rows": self.tools.table_max_rows,
+            },
+        )
+
     def _commit_plain(self, session: Session, question: str, answer: str) -> None:
         session.commit(
             [*session.api_messages, {"role": "user", "content": question}, {"role": "assistant", "content": answer}],
@@ -370,10 +399,15 @@ MSG_CUT_SHORT = (
 )
 
 
-def _timeout_fallback(partial: str, table: dict | None) -> tuple[str, str] | None:
+def _timeout_fallback(partial: str, table: dict | None, *, table_shown: bool = False) -> tuple[str, str] | None:
     """What to show when the deadline hits: ("partial" | "table", text), or None for the plain apology."""
     if len(partial) >= _PARTIAL_MIN_CHARS:
         return "partial", partial + MSG_CUT_SHORT
+    if table_shown:
+        return "table", (
+            "I ran out of time writing a summary, but the query finished: the full results are in the table below, "
+            "with Excel and CSV download. They come straight from the data and weren't retyped."
+        )
     if table and table.get("columns") and table.get("rows"):
         return "table", (
             "I ran out of time writing the answer, but the query had already finished. "
@@ -382,6 +416,13 @@ def _timeout_fallback(partial: str, table: dict | None) -> tuple[str, str] | Non
             + "\n\n_Asking about fewer places or one measure at a time will get you a full answer._"
         )
     return None
+
+
+def _with_table_notes(text: str, tables: list[str]) -> str:
+    """Transcript copy of an answer: notes which tables were shown (tables aren't re-sent on page reload)."""
+    if not tables:
+        return text
+    return text + "\n\n" + "\n".join(f"_Table shown: {t} (re-ask to download it again)._" for t in tables)
 
 
 def _markdown_table(columns: list[str], rows: list[list[Any]], max_rows: int = 60) -> str:

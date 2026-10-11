@@ -44,7 +44,7 @@ Expand **How I got this** under any answer to see the exact SQL that produced it
 | Comprehensive mapping (no subset) | Catalog built from the share's own metadata: all 8,084 fields, 353 tables, both releases, no hard-coded columns | `catalog.py` | `scripts/inspect_schema.py`; catalog tests |
 | Context awareness of the schema | Table-level overview in the (cached) system prompt; field-level detail on demand via `search_fields` / `describe_table` | `catalog.py`, `tools.py` | Agent picks e.g. B15003e22–e25 or B19001 brackets unaided in evals |
 | Deployment "truth" | CI builds the image and boots it with no credentials (must come up degraded, not crash); background catalog load so health checks pass immediately | `.github/workflows/ci.yml` | CI run |
-| Meaningful tests | 122 offline tests (DuckDB stand-in for Snowflake, scripted model) + 26 live evals with independent ground truth | `tests/`, `evals/` | See *Tests* below |
+| Meaningful tests | 133 offline tests (DuckDB stand-in for Snowflake, scripted model) + 27 live evals with independent ground truth | `tests/`, `evals/` | See *Tests* below |
 
 ## Architecture
 
@@ -135,6 +135,7 @@ Details the diagrams leave out:
 - **Input classifier outcomes:** answer, chitchat, not in the dataset, off-topic, unsafe. Anything except "answer" gets an immediate reply. If the classifier errors, the message goes to the agent (it fails open; see REFLECTION.md).
 - **Grounding checks, in order:** (a) a free heuristic: large figures with no query at all trigger a retry; (b) the Haiku verifier checks every data claim against this turn's tool results, allowing arithmetic. One retry, then a visible caveat.
 - **Field search** is BM25 over the field descriptions of both releases; **place lookup** turns a state or county name into its GEOID prefix and returns every candidate when a name is ambiguous.
+- **Large results.** The model sees at most 200 rows of any query (the first 180 and the last 20). For lists such as "every county", the agent sets `show_table`. The app then shows the user the full result, up to 10,000 rows, as a table built straight from the data, with **Excel** and **CSV** downloads (`/api/tables/...`, same login, `app/export.py`), and the model writes only the summary.
 - **Snowflake setup** (role, warehouse, credit cap) is in `scripts/snowflake_setup.sql`.
 
 ### Key decisions
@@ -206,7 +207,7 @@ job inside the account. I considered each piece:
 
 **Why the trade-off favours the current design for this brief.**
 1. **Comprehensive coverage.** The schema is reached through retrieval tools over the share's own metadata, so every column can be answered without curating a subset first.
-2. **Control and testability.** Every step — guardrail, retrieval, SQL validation, deadline, grounding check — is ordinary Python. That's why 122 offline tests can pin down its behaviour.
+2. **Control and testability.** Every step — guardrail, retrieval, SQL validation, deadline, grounding check — is ordinary Python. That's why 133 offline tests can pin down its behaviour.
 3. **Model quality.** Correct aggregation (never summing medians, matching numerator and denominator universes) is mostly a reasoning problem, so I wanted the strongest current model.
 
 **What it costs.** I maintain an orchestration loop and session store that
@@ -252,8 +253,9 @@ app/
   sessions.py     in-memory conversation store
   logging_setup.py  JSON logs with per-request correlation ids
   prompts.py      all prompt text
+  export.py       Excel/CSV downloads for result tables
   static/index.html
-tests/            122 offline tests (DuckDB stands in for Snowflake, scripted LLM)
+tests/            133 offline tests (DuckDB stands in for Snowflake, scripted LLM)
 evals/            live end-to-end cases (real Claude + Snowflake) + runner
 scripts/          snowflake_setup.sql, inspect_schema.py
 ```
@@ -286,9 +288,9 @@ uv run python -m evals.run_evals     # live, costs a few cents; needs .env
 ```
 
 **Latest live run** (2026-10-10, Claude Opus 5.5 agent, Haiku 5.5 guardrail and verifier):
-- 26/26 cases passed. Median turn 13.5 s, slowest 37.5 s (all 52 states with a median estimate each); guardrail rejections ~2 s.
-- About 4¢ per answered question; ~97% of input tokens served from the prompt cache.
-- The verifier passed all 17 answers that stated figures.
+- 27/27 cases passed. Median turn 13.3 s, slowest 40.1 s; guardrail rejections ~2 s. Listing every county (3,221 rows, shown as a full table) takes about 21 s.
+- About 5¢ per answered question; ~97% of input tokens served from the prompt cache.
+- The verifier checked 19 answers: 18 passed (three after one retry) and one went out with its caveat. That one was the agent rightly noticing the 2019 tables were mislabelled as 2020 dollars, a catalog bug now fixed.
 
 Earlier runs found real problems, each now covered by a test or eval case:
 - **Verifier false alarm.** It was only given SQL results, so a true count from the place lookup looked unsupported. Fixed by passing it every tool result; regression test `test_verifier_gets_non_sql_tool_results_too`.
@@ -300,7 +302,7 @@ CI (`.github/workflows/ci.yml`) runs on every push:
 - a Docker build, then a boot smoke test with no credentials, which must come up in degraded mode.
 
 - **Offline suite (`tests/`).** Deterministic and runs in CI. DuckDB is seeded with a miniature copy of the share, using the same table and column names, so tools and the agent run real SQL. A scripted LLM replays tool calls, which tests the loop's behaviour: SQL errors fed back for retry, a database outage mid-turn, deadlines, step limits, the grounding retry, refusals, history validity after failures, guardrail routing and fail-open. A separate set of tests covers the SQL validator against injection and escape attempts.
-- **Live evals (`evals/cases.yaml`).** 26 cases across categories: lookups, ratios, rankings, the median caveat, multi-turn, multi-year comparisons (with the overlap and dollar caveats), ambiguity, partial matches, unanswerable, off-topic and adversarial. Numeric answers are checked against hand-written ground-truth SQL that the runner executes directly, independent of the agent. The runner also checks the 60 s limit per turn.
+- **Live evals (`evals/cases.yaml`).** 27 cases across categories: lookups, ratios, rankings, the median caveat, multi-turn, multi-year comparisons (with the overlap and dollar caveats), ambiguity, partial matches, unanswerable, off-topic and adversarial. Numeric answers are checked against hand-written ground-truth SQL that the runner executes directly, independent of the agent. The runner also checks the 60 s limit per turn.
 
 ## Deploying
 

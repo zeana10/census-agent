@@ -117,6 +117,16 @@ now eval case 26. The lesson is the uncomfortable one: my eval set reflected the
 questions *I* thought to ask, and the first other person found a gap in a few
 minutes.
 
+**10. Big lists.** Testing what happens past the 200-row cap, "every county"
+came back as the 200 largest counties, retyped by the model, with a
+"Correction" line where it had mistyped one. The cap was my choice, not the
+brief's, and it was protecting the model's context while also limiting the user.
+Now the app shows the user the whole result (3,221 counties) as a table with
+Excel and CSV downloads, built from the data itself, and the model only writes
+the summary. The verifier earned its keep on the first run of this too: the
+model guessed that Puerto Rico was "probably" included, the verifier flagged
+the guess, and the retry ran a query to check before saying so.
+
 ### Mistakes I'd call out
 
 Most of these were bugs in code Claude wrote that I didn't catch on the first
@@ -219,7 +229,7 @@ I split testing by what each kind of test is good at:
 - **The agent loop's control flow, tested offline** with a scripted model.
 - **Answer quality, tested live** against real data.
 
-**Offline (122 tests, about 10 seconds, no credentials).** These cover:
+**Offline (133 tests, about 13 seconds, no credentials).** These cover:
 - the SQL validator against injection and escape attempts;
 - schema discovery, field search and place lookup, including ambiguous names;
 - the agent loop under failure: SQL errors, the database dropping mid-turn,
@@ -233,12 +243,12 @@ no credentials.
 The trade-off is that the offline tests run on DuckDB, not Snowflake.
 Snowflake-specific SQL problems only show up live.
 
-**Live (26 cases, about 8 minutes, about 75¢).** These are lookups, ratios,
+**Live (27 cases, about 9 minutes, about 80¢).** These are lookups, ratios,
 rankings, follow-ups, year comparisons, ambiguous and unanswerable questions,
 and adversarial ones. For the cases with a specific number, the runner works
 out the right answer with its own hand-written SQL, independent of the agent,
 and checks the answer matches.
-- **Results:** 24/24 on the first run; 26/26 on the latest, with the verifier
+- **Results:** 24/24 on the first run; 27/27 on the latest, with the verifier
   switched on.
 - **Speed:** median turn about 13 seconds, slowest about 38 (every state at once). Guardrail rejections about
   2 seconds.

@@ -47,7 +47,9 @@ class Settings(BaseSettings):
     wrap_up_at_s: float = 12.0  # with this little time left, tell the model to answer with what it has
     min_step_s: float = 3.0  # don't start a model step with less time than this
     sql_timeout_s: int = 25
-    max_result_rows: int = 200
+    max_result_rows: int = 200  # rows the *model* sees from any query
+    table_max_rows: int = 10_000  # rows the *user* can see/download when the agent shows a table
+    tables_per_session: int = 20  # oldest downloadable tables are dropped beyond this
     max_agent_steps: int = 10
     max_question_chars: int = 2000
     max_history_turns: int = 20

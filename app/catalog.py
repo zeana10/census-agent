@@ -179,6 +179,7 @@ class Catalog:
     def to_json(self) -> str:
         return json.dumps(
             {
+                "version": CATALOG_VERSION,
                 "years": self.years,
                 "database": self.database,
                 "schema": self.schema,
@@ -294,6 +295,13 @@ def build_catalog(wh: Warehouse, *, database: str, schema: str, years: list[str]
 
     if geo_table:
         allowed.append(geo_table)
+    if len(years) > 1:
+        # Labels come from the latest release, which would claim e.g. "2020 inflation-adjusted dollars"
+        # for the 2019 tables too. Each release is in its own year's dollars, so say that instead.
+        for t in tables.values():
+            t.title = _release_dollars(t.title)
+        for f in fields.values():
+            f.label = _release_dollars(f.label)
     return Catalog(
         years=years,
         database=database,
@@ -325,7 +333,8 @@ def load_or_build(wh: Warehouse, *, cache_path: str, database: str, schema: str,
     if p.exists():
         try:
             cat = Catalog.from_json(p.read_text())
-            if (cat.database, cat.schema, cat.years) == (database, schema, sorted(years)):
+            fresh = json.loads(p.read_text()).get("version") == CATALOG_VERSION
+            if fresh and (cat.database, cat.schema, cat.years) == (database, schema, sorted(years)):
                 log.info("catalog loaded from %s (%d fields)", p, len(cat.fields))
                 return cat
         except (KeyError, TypeError, ValueError):
@@ -337,6 +346,16 @@ def load_or_build(wh: Warehouse, *, cache_path: str, database: str, schema: str,
         log.warning("could not write catalog cache to %s", p)
     log.info("catalog built from Snowflake (%d fields, %d tables, years %s)", len(cat.fields), len(cat.tables), cat.years)
     return cat
+
+
+# Bump when catalog contents change meaning, so stale caches are rebuilt rather than served.
+CATALOG_VERSION = 2
+
+_DOLLAR_YEAR_RE = re.compile(r"\b(?:19|20)\d{2}(\s+inflation-adjusted dollars)", re.I)
+
+
+def _release_dollars(text: str) -> str:
+    return _DOLLAR_YEAR_RE.sub(r"release-year\1", text)
 
 
 def _field_label(levels: list, *, title: str, universe: str) -> str:

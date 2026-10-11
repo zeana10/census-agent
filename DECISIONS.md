@@ -245,7 +245,39 @@ decisions came out of it:
 The question is now an eval case, and its check would fail if the biased median
 came back.
 
-### 18. Things I chose not to do (yet)
+### 18. Show users the full result; keep the model's view small
+
+The 200-row cap was my own choice, not something the brief asked for, and it was
+there to protect the *model*: every row it reads costs time and tokens. But it
+was also capping the *user*. Asking for every county got 200 of 3,221, and the
+model retyped all 200 numbers into its answer. It mistyped one (Hudson County,
+NJ) and had to add a "Correction" line, and there was no time left to verify
+the rest.
+
+So I split the two:
+- **The user** gets the full result, up to 10,000 rows, as a scrollable table
+  under the answer. The app builds it straight from Snowflake's rows, so it can't
+  be mistyped. There are **Download Excel** and **Download CSV** buttons; the
+  Excel file has an "About" sheet with the question, the source, and the exact
+  SQL that produced it.
+- **The model** still sees at most 200 rows: the first 180 and the last 20, so
+  it can talk about both the largest and the smallest. It also gets the total
+  row count. It writes the summary and never retypes the table.
+
+Details I cared about:
+- downloads use the same login as the app;
+- table links are unguessable;
+- only the 20 most recent tables per conversation are kept;
+- text that Excel would run as a formula is neutralised;
+- the CSV has a byte-order mark so Excel opens accented place names correctly.
+
+*Considered:* raising the model's cap (slow, expensive and still error-prone)
+and generating the file in the model's own response (same retyping problem).
+
+The 10,000-row ceiling covers every county; block-group-level lists (240,000
+rows) are deliberately out of reach.
+
+### 19. Things I chose not to do (yet)
 
 - **Durable conversation storage.** Memory is fine for a one-instance demo;
   Redis would be the next step.

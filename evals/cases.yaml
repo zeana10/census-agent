@@ -7,6 +7,7 @@
 #   expect_any          - at least one of these substrings (case-insensitive) must appear
 #   expect_none         - none of these substrings may appear
 #   min_queries         - at least this many successful SQL queries in the final turn
+#   expect_table_rows   - a full result table with at least this many rows was shown to the user
 
 - id: tx_population
   category: simple_lookup
@@ -170,3 +171,12 @@
   # The bracket-interpolation estimate for Texas is about $64,3xx; averaging block-group
   # medians gives about $74,3xx (16% high) and must not appear.
   expect_none: ["74,3", "took too long"]
+
+- id: every_county_table
+  category: wide_answer
+  # More rows than the model sees (200): the user must get the full table, and the
+  # model must summarise rather than retype it (it once mistyped a population doing so).
+  turns: ["List the population of every county in the US"]
+  min_queries: 1
+  expect_table_rows: 3000
+  expect_none: ["Correction", "took too long"]

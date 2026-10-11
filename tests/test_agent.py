@@ -414,3 +414,13 @@ def test_markdown_table_formats_and_caps_rows():
     assert "| 48 | 28,635,442 | 0.21 |" in out
     big = _markdown_table(["N"], [[i] for i in range(100)], max_rows=10)
     assert "Showing 10 of 100 rows" in big
+
+
+async def test_deadline_after_a_table_was_shown_points_to_the_table(executor, settings):
+    settings.request_deadline_s, settings.wrap_up_at_s, settings.min_step_s = 1.5, 0.2, 0.1
+    sql = 'SELECT "CENSUS_BLOCK_GROUP", "B01003e1" FROM "2019_CBG_B01" ORDER BY 2 DESC'
+    llm = _StallAfterStreaming(steps=[tool_turn(("run_sql", {"sql": sql, "purpose": "x", "show_table": True}))], partial="")
+    rec = Recorder()
+    stats = await make_agent(llm, executor, settings).answer(Session(id="s"), "List them", rec)
+    assert stats.outcome == "timeout_partial" and rec.of("table")
+    assert "full results are in the table below" in rec.visible_text

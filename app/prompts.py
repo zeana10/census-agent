@@ -40,11 +40,13 @@ universe, and its physical table pattern; tables marked "only <year>" exist in t
 - Use only the tables listed above. Fields from different physical tables of the SAME year can be joined on \
 "CENSUS_BLOCK_GROUP". To compare years, aggregate each year separately (e.g. two subqueries); block-group boundaries \
 can differ between releases, so never join block groups across years.
-- Prefer one aggregate query over many small ones. Results are capped at {max_rows} rows.
+- Prefer one aggregate query over many small ones. You see at most {max_rows} rows of any result; a table shown to \
+the user (show_table=true) can hold up to {table_max_rows:,} rows.
 - For questions that cover many places (every state, every county), do the per-row arithmetic in SQL: percentages, \
 ratios, averages, and any median estimated from bracket counts. ORDER BY the main measure and select only the columns \
-you'll show. Then present a compact table with a short summary, not commentary on each row. Long answers can run into \
-the response time limit.
+you'll show, with readable column aliases. Run it with show_table=true so the app shows the full result as a table \
+(with Excel and CSV download), and write only a short summary: what the table shows, totals, the notable highs and \
+lows, caveats. Never retype a table's rows yourself; that is slow and error-prone.
 
 # Getting the numbers right
 - Count fields (people, households, housing units) can be SUMmed across block groups.
@@ -153,7 +155,7 @@ def _span(year: str) -> str:
     return f"{int(year) - 4}-{year}"
 
 
-def build_agent_system(catalog: Catalog, *, max_rows: int) -> str:
+def build_agent_system(catalog: Catalog, *, max_rows: int, table_max_rows: int = 10_000) -> str:
     releases = "\n".join(f'- "{y}": ACS 5-year estimates covering {_span(y)}.' for y in catalog.years)
     return AGENT_SYSTEM.format(
         releases=releases,
@@ -161,4 +163,5 @@ def build_agent_system(catalog: Catalog, *, max_rows: int) -> str:
         latest_span=_span(catalog.latest_year),
         table_overview=catalog.table_overview(),
         max_rows=max_rows,
+        table_max_rows=table_max_rows,
     )

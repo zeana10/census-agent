@@ -19,7 +19,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from pydantic import BaseModel, Field
 
-from . import logging_setup
+from . import export, logging_setup
 from .agent import MSG_WAREHOUSE_DOWN, Agent
 from .catalog import load_or_build
 from .config import Settings, get_settings
@@ -63,8 +63,11 @@ class Runtime:
                     schema=self.s.snowflake_schema,
                     years=self.s.years,
                 )
-                tools = ToolExecutor(catalog, Geography(catalog), self.wh, max_rows=self.s.max_result_rows)
-                self.agent = Agent(self.llm, tools, build_agent_system(catalog, max_rows=self.s.max_result_rows), self.s)
+                tools = ToolExecutor(
+                    catalog, Geography(catalog), self.wh, max_rows=self.s.max_result_rows, table_max_rows=self.s.table_max_rows
+                )
+                system = build_agent_system(catalog, max_rows=self.s.max_result_rows, table_max_rows=self.s.table_max_rows)
+                self.agent = Agent(self.llm, tools, system, self.s)
                 self.last_error = None
                 log.info("agent ready: %d tables, %d fields", len(catalog.tables), len(catalog.fields))
             except Exception as e:
@@ -295,6 +298,27 @@ def create_app(settings: Settings | None = None, *, runtime: Runtime | None = No
             stream(),
             media_type="text/event-stream",
             headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no", "X-Request-ID": rid},
+        )
+
+    @app.get("/api/tables/{session_id}/{table_id}.{fmt}", dependencies=[Depends(require_auth)])
+    async def download_table(request: Request, session_id: str, table_id: str, fmt: str) -> Response:
+        session = request.app.state.sessions.get(session_id)
+        table = session.tables.get(table_id) if session else None
+        if table is None:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND, "This table has expired. Ask the question again to get a fresh download."
+            )
+        if fmt == "csv":
+            body, media = export.to_csv(table), "text/csv; charset=utf-8"
+        elif fmt == "xlsx":
+            body = await asyncio.to_thread(export.to_xlsx, table)
+            media = "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        else:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Unknown format; use .csv or .xlsx")
+        return Response(
+            body,
+            media_type=media,
+            headers={"Content-Disposition": f'attachment; filename="{export.filename(table, fmt)}"', "Cache-Control": "no-store"},
         )
 
     @app.post("/api/reset", dependencies=[Depends(require_auth)])

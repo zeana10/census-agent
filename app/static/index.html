@@ -48,6 +48,18 @@
   .meta { margin-top: 10px; font-size: 12px; color: var(--muted); display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
   .meta button { background: none; border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 3px 10px; font-size: 12px; }
   .note { font-size: 12px; color: var(--muted); margin-top: 6px; }
+  .rtable { margin-top: 12px; border: 1px solid var(--border); border-radius: 10px; overflow: hidden; }
+  .rtable-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
+                 padding: 8px 10px; background: var(--code); font-size: 13px; }
+  .rtable-head .title { font-weight: 600; }
+  .rtable-head .dl { display: flex; gap: 6px; }
+  .rtable-head a { border: 1px solid var(--border); border-radius: 8px; padding: 3px 10px; color: var(--text);
+                   text-decoration: none; background: var(--panel); font-size: 12px; }
+  .rtable-scroll { max-height: 420px; overflow: auto; }
+  .rtable table { border-collapse: collapse; width: 100%; font-size: 13px; display: table; margin: 0; }
+  .rtable th, .rtable td { border-bottom: 1px solid var(--border); padding: 4px 10px; text-align: left; white-space: nowrap; }
+  .rtable th { position: sticky; top: 0; background: var(--panel); }
+  .rtable td.num { text-align: right; font-variant-numeric: tabular-nums; }
   .foot { max-width: 820px; margin: 6px auto 0; color: var(--muted); font-size: 11px; text-align: center; }
 </style>
 </head>
@@ -118,8 +130,42 @@ function addAssistant(text) {
   const d = document.createElement('div'); d.className = 'msg';
   const body = document.createElement('div'); body.className = 'body'; body.innerHTML = md(text || '');
   const st = document.createElement('div'); st.className = 'status';
-  d.append(body, st); log.appendChild(d); scroll();
-  return { el: d, body, st, text: text || '', queries: [] };
+  const tables = document.createElement('div');
+  d.append(body, tables, st); log.appendChild(d); scroll();
+  return { el: d, body, st, tables, text: text || '', queries: [] };
+}
+
+// A full query result, rendered from the data itself (never retyped by the model), with downloads.
+function addTable(m, t) {
+  const box = document.createElement('div'); box.className = 'rtable';
+  const head = document.createElement('div'); head.className = 'rtable-head';
+  const title = document.createElement('span'); title.className = 'title';
+  title.textContent = (t.purpose || 'Query result') + ' · ' + t.rows.length.toLocaleString() + ' rows'
+    + (t.truncated ? ' (first ' + t.max_rows.toLocaleString() + ' only)' : '');
+  const dl = document.createElement('span'); dl.className = 'dl';
+  for (const [fmt, label] of [['xlsx', 'Download Excel'], ['csv', 'Download CSV']]) {
+    const a = document.createElement('a');
+    a.href = '/api/tables/' + encodeURIComponent(t.session_id) + '/' + encodeURIComponent(t.id) + '.' + fmt;
+    a.textContent = label; a.setAttribute('download', '');
+    dl.appendChild(a);
+  }
+  head.append(title, dl);
+  const scrollBox = document.createElement('div'); scrollBox.className = 'rtable-scroll';
+  const table = document.createElement('table');
+  const thead = table.createTHead().insertRow();
+  for (const c of t.columns) { const th = document.createElement('th'); th.textContent = c; thead.appendChild(th); }
+  const tbody = table.createTBody();
+  for (const row of t.rows) {
+    const tr = tbody.insertRow();
+    for (const v of row) {
+      const td = tr.insertCell();
+      if (typeof v === 'number') { td.className = 'num'; td.textContent = Number.isInteger(v) ? v.toLocaleString() : v.toLocaleString(undefined, { maximumFractionDigits: 2 }); }
+      else td.textContent = v == null ? '' : String(v);
+    }
+  }
+  scrollBox.appendChild(table);
+  box.append(head, scrollBox);
+  m.tables.appendChild(box); scroll();
 }
 function setStatus(m, s) { m.st.innerHTML = s ? '<span class="dot"></span>' : ''; if (s) m.st.append(s); }
 function render(m) { m.body.innerHTML = md(m.text); scroll(); }
@@ -178,6 +224,7 @@ async function ask(question) {
         else if (ev === 'reset') { m.text = ''; render(m); }
         else if (ev === 'replace') { m.text = d.text; render(m); }
         else if (ev === 'sql') m.queries.push(d);
+        else if (ev === 'table') addTable(m, d);
         else if (ev === 'done') { setStatus(m, ''); addQueries(m); outcome = d.outcome; requestId = d.request_id; }
       }
     }
