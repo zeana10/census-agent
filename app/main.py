@@ -199,7 +199,17 @@ def create_app(settings: Settings | None = None, *, runtime: Runtime | None = No
         # will explain that the database is unreachable instead of answering.
         rt: Runtime = request.app.state.runtime
         ready = rt.agent is not None
-        return JSONResponse({"status": "ok" if ready else "degraded", "detail": None if ready else "census catalog not loaded"})
+        # Proxy shape (counts and header names only, never addresses), used to choose TRUSTED_PROXY_HOPS
+        # on a new host: if a direct request shows N forwarded entries, N proxies appended to the header.
+        xff = [h for h in request.headers.get("x-forwarded-for", "").split(",") if h.strip()]
+        client_ip_headers = sorted(h for h in ("true-client-ip", "cf-connecting-ip", "x-real-ip") if h in request.headers)
+        return JSONResponse(
+            {
+                "status": "ok" if ready else "degraded",
+                "detail": None if ready else "census catalog not loaded",
+                "proxy": {"forwarded_for_entries": len(xff), "client_ip_headers": client_ip_headers},
+            }
+        )
 
     @app.get("/", dependencies=[Depends(require_auth)])
     async def index() -> FileResponse:
