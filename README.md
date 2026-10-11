@@ -11,9 +11,9 @@ state and county.
 
 | | |
 |---|---|
-| URL | **TODO: https://census-assistant.onrender.com** |
+| URL | **https://census-assistant.onrender.com** |
 | Username | `reviewer` |
-| Password | **TODO** |
+| Password | `cMROLhfBErc3guMQM28o` |
 
 Questions worth trying, covering the main behaviours:
 
