@@ -48,29 +48,94 @@ Expand **How I got this** under any answer to see the exact SQL that produced it
 
 ## Architecture
 
+**What talks to what.** Everything runs in one container on Render; the models are called over the Anthropic API, and the census data lives in Snowflake.
+
+```mermaid
+flowchart TB
+    user(["Browser · chat UI with live progress"])
+
+    subgraph render["Render (Docker)"]
+        api["Web layer · app/main.py<br/>login · rate limits per session, IP and overall<br/>one turn at a time per conversation · streaming"]
+        agent["Agent loop · app/agent.py<br/>50 s deadline · up to 10 steps<br/>a turn completes or never happened"]
+        guard["Validation layer · app/guardrails.py<br/>in: precheck + classifier<br/>out: grounding checks"]
+        tools["Tools · app/tools.py<br/>search_fields · describe_table<br/>resolve_geography · run_sql"]
+        sessions[("Conversations<br/>in memory")]
+        catalog[("Schema catalog<br/>8,084 fields · 353 tables<br/>2019 + 2020")]
+        sqlcheck["SQL check · app/sql_guard.py<br/>one SELECT · census tables only · row cap"]
+    end
+
+    subgraph anthropic["Anthropic API"]
+        haiku["Claude Haiku 5.5<br/>input classifier + output verifier"]
+        opus["Claude Opus 5.5<br/>plans, queries, writes the answer"]
+    end
+
+    subgraph snowflake["Snowflake"]
+        role["CENSUS_READER role<br/>read-only · statement timeout · credit cap"]
+        share[("US Open Census share<br/>ACS 2019 + 2020 by block group<br/>+ metadata tables")]
+    end
+
+    user -- "question" --> api
+    api -- "progress · SQL · answer" --> user
+    api <--> sessions
+    api --> agent
+    agent <--> guard
+    agent --> tools
+    tools --> catalog
+    tools --> sqlcheck
+    guard <--> haiku
+    agent <--> opus
+    sqlcheck --> role --> share
+    share -. "metadata read at startup" .-> catalog
 ```
-Browser (static HTML/JS, SSE)
-  │  POST /api/chat  ── streams: status · sql · delta · done
-  ▼
-FastAPI (app/main.py)  ── basic auth · session/IP/global rate limits · per-session lock · keep-alives
-  │
-  ▼
-Agent (app/agent.py), per user turn, hard 50 s deadline:
-  1. precheck            empty / too long / control chars                (guardrails.py)
-  2. input classifier    answer | chitchat | out_of_dataset | off_topic | unsafe
-                         non-"answer" → immediate reply, no DB access    (fast-fail path)
-  3. tool loop           Claude ⇄ tools, ≤ 10 steps, tools run in parallel
-        search_fields      BM25 over ~8k field descriptions, 2019 + 2020   (catalog.py)
-        describe_table     every field in one ACS table
-        resolve_geography  state/county name → GEOID prefix + SQL filter (geography.py)
-        run_sql            sqlglot allow-list → Snowflake (read-only role) (sql_guard.py, warehouse.py)
-  4. grounding checks    (a) large figures but no query at all → retry       (guardrails.py)
-                         (b) LLM verifier (Haiku): every data claim vs this turn's
-                             query results, allowing arithmetic → 1 retry, then caveat
-  │
-  ▼
-Snowflake: CENSUS_READER role (IMPORTED PRIVILEGES only) · X-Small WH · statement timeout · credit cap
+
+**What happens for one question.** Off-topic and unsafe messages are answered by the classifier in about 2 s without touching the database. Everything else goes through the tool loop and then the grounding check.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant A as App
+    participant H as Haiku 5.5
+    participant O as Opus 5.5
+    participant S as Snowflake
+
+    U->>A: Question
+    A->>A: Precheck and rate limits
+    A->>H: Classify, with recent turns for context
+    alt Off-topic, unsafe, not in the data, or small talk
+        H-->>A: Decision and a short reply
+        A-->>U: Reply in about 2 s, no database access
+    else A question to answer
+        loop Up to 10 steps within a 50 s deadline
+            A->>O: Conversation so far, plus tool results
+            O-->>A: Tool calls
+            A-->>U: Progress line, e.g. Looking up Texas
+            A->>A: Field search, place lookup, SQL check
+            A->>S: Read-only SELECT
+            S-->>A: Rows
+            A-->>U: The SQL, for How I got this
+        end
+        O-->>A: Answer
+        A-->>U: Answer streams in
+        A->>H: Check every figure against this turn's tool results
+        alt Unsupported claim
+            H-->>A: The claims it couldn't verify
+            A->>O: One retry, naming those claims
+            O-->>A: Corrected answer
+            A-->>U: Replaces the first answer, with a caveat if still unsupported
+        else Supported
+            H-->>A: OK
+        end
+        A->>A: Save the turn to the conversation
+    end
+    A-->>U: Done, with a request ID
 ```
+
+Details the diagrams leave out:
+- **Input classifier outcomes:** answer, chitchat, not in the dataset, off-topic, unsafe. Anything except "answer" gets an immediate reply. If the classifier errors, the message goes to the agent (it fails open; see REFLECTION.md).
+- **Grounding checks, in order:** (a) a free heuristic: large figures with no query at all trigger a retry; (b) the Haiku verifier checks every data claim against this turn's tool results, allowing arithmetic. One retry, then a visible caveat.
+- **Field search** is BM25 over the field descriptions of both releases; **place lookup** turns a state or county name into its GEOID prefix and returns every candidate when a name is ambiguous.
+- **Snowflake setup** (role, warehouse, credit cap) is in `scripts/snowflake_setup.sql`.
 
 ### Key decisions
 
