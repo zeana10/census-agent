@@ -106,23 +106,27 @@ class Agent:
         grounding_checks = 0
         queried_this_turn = False
         turn_results: list[str] = []  # successful tool results this turn, for the verifier
+        streamed: list[str] = []  # text streamed in the current model step, kept if the deadline hits
+        last_table: dict | None = None  # most recent successful query result, the fallback answer
 
         async def on_text(t: str) -> None:
+            streamed.append(t)
             await emit("delta", {"text": t})
 
         try:
             while True:
                 remaining = deadline - time.monotonic()
-                out_of_budget = stats.steps >= self.s.max_agent_steps or remaining < 12
+                out_of_budget = stats.steps >= self.s.max_agent_steps or remaining < self.s.wrap_up_at_s
                 if out_of_budget and not wrap_up_sent:
                     if messages[-1]["role"] == "assistant":
                         break  # nothing pending; keep what we have
                     messages.append({"role": "system", "content": WRAP_UP})
                     wrap_up_sent = True
-                if remaining < 3:
+                if remaining < self.s.min_step_s:
                     raise TimeoutError
 
                 stats.steps += 1
+                streamed.clear()
                 turn: Turn = await asyncio.wait_for(
                     self.llm.agent_turn(system=self.system, messages=messages, tools=TOOL_DEFS, on_text=on_text),
                     timeout=remaining,
@@ -148,6 +152,7 @@ class Agent:
                         if c.name == "run_sql":
                             purpose = c.input.get("purpose", "") if isinstance(c.input, dict) else ""
                             turn_results.append(f"run_sql ({purpose}):\n{r.meta.get('sql', '')}\nResult: {r.content}")
+                            last_table = {"purpose": purpose, **json.loads(r.content)}
                         else:
                             turn_results.append(f"{c.name}({json.dumps(c.input)[:200]}):\n{r.content}")
                     queried_this_turn = queried_this_turn or any(
@@ -226,8 +231,20 @@ class Agent:
             stats.outcome = "warehouse_unavailable"
             await self._fail(session, question, e.user_safe or MSG_WAREHOUSE_DOWN, emit)
         except TimeoutError:
-            stats.outcome = "timeout"
-            await self._fail(session, question, MSG_TIMEOUT, emit)
+            # Degrade instead of discarding work: keep a substantial partial answer, or show
+            # the data we already fetched. Only apologise if there's nothing to show.
+            fallback = _timeout_fallback("".join(streamed).strip(), last_table)
+            if fallback is None:
+                stats.outcome = "timeout"
+                await self._fail(session, question, MSG_TIMEOUT, emit)
+            else:
+                stats.outcome = "timeout_partial"
+                log.warning("deadline hit; returning partial answer", extra={"kind": fallback[0]})
+                await emit("replace", {"text": fallback[1]})
+                if messages[-1]["role"] == "assistant":
+                    self._commit_plain(session, question, fallback[1])
+                else:
+                    session.commit([*messages, {"role": "assistant", "content": fallback[1]}], question, fallback[1])
         except LLMError as e:
             stats.outcome = "llm_error"
             msg = e.user_safe + (" Please try again." if e.retryable else "")
@@ -344,6 +361,44 @@ class Agent:
         # Drop the partial turn (it may end in an unanswered tool_use) and record a plain exchange instead.
         self._commit_plain(session, question, message)
         await emit("replace", {"text": message})
+
+
+_PARTIAL_MIN_CHARS = 200
+MSG_CUT_SHORT = (
+    "\n\n_I hit the time limit while writing this, so the answer may be incomplete and its figures weren't "
+    "double-checked. Asking about fewer places or one measure at a time will be faster._"
+)
+
+
+def _timeout_fallback(partial: str, table: dict | None) -> tuple[str, str] | None:
+    """What to show when the deadline hits: ("partial" | "table", text), or None for the plain apology."""
+    if len(partial) >= _PARTIAL_MIN_CHARS:
+        return "partial", partial + MSG_CUT_SHORT
+    if table and table.get("columns") and table.get("rows"):
+        return "table", (
+            "I ran out of time writing the answer, but the query had already finished. "
+            f"Here are its results ({table.get('purpose') or 'raw data'}), unformatted and not double-checked:\n\n"
+            + _markdown_table(table["columns"], table["rows"])
+            + "\n\n_Asking about fewer places or one measure at a time will get you a full answer._"
+        )
+    return None
+
+
+def _markdown_table(columns: list[str], rows: list[list[Any]], max_rows: int = 60) -> str:
+    def fmt(v: Any) -> str:
+        if isinstance(v, bool) or v is None:
+            return "" if v is None else str(v)
+        if isinstance(v, int):
+            return f"{v:,}"
+        if isinstance(v, float):
+            return f"{v:,.2f}"
+        return str(v).replace("|", "\\|")
+
+    lines = ["| " + " | ".join(map(str, columns)) + " |", "|" + "---|" * len(columns)]
+    lines += ["| " + " | ".join(fmt(v) for v in row) + " |" for row in rows[:max_rows]]
+    if len(rows) > max_rows:
+        lines.append(f"\n_Showing {max_rows} of {len(rows)} rows._")
+    return "\n".join(lines)
 
 
 def _status_for(name: str, args: Any) -> str:

@@ -44,7 +44,7 @@ Expand **How I got this** under any answer to see the exact SQL that produced it
 | Comprehensive mapping (no subset) | Catalog built from the share's own metadata: all 8,084 fields, 353 tables, both releases, no hard-coded columns | `catalog.py` | `scripts/inspect_schema.py`; catalog tests |
 | Context awareness of the schema | Table-level overview in the (cached) system prompt; field-level detail on demand via `search_fields` / `describe_table` | `catalog.py`, `tools.py` | Agent picks e.g. B15003e22–e25 or B19001 brackets unaided in evals |
 | Deployment "truth" | CI builds the image and boots it with no credentials (must come up degraded, not crash); background catalog load so health checks pass immediately | `.github/workflows/ci.yml` | CI run |
-| Meaningful tests | 118 offline tests (DuckDB stand-in for Snowflake, scripted model) + 25 live evals with independent ground truth | `tests/`, `evals/` | See *Tests* below |
+| Meaningful tests | 122 offline tests (DuckDB stand-in for Snowflake, scripted model) + 26 live evals with independent ground truth | `tests/`, `evals/` | See *Tests* below |
 
 ## Architecture
 
@@ -206,7 +206,7 @@ job inside the account. I considered each piece:
 
 **Why the trade-off favours the current design for this brief.**
 1. **Comprehensive coverage.** The schema is reached through retrieval tools over the share's own metadata, so every column can be answered without curating a subset first.
-2. **Control and testability.** Every step — guardrail, retrieval, SQL validation, deadline, grounding check — is ordinary Python. That's why 118 offline tests can pin down its behaviour.
+2. **Control and testability.** Every step — guardrail, retrieval, SQL validation, deadline, grounding check — is ordinary Python. That's why 122 offline tests can pin down its behaviour.
 3. **Model quality.** Correct aggregation (never summing medians, matching numerator and denominator universes) is mostly a reasoning problem, so I wanted the strongest current model.
 
 **What it costs.** I maintain an orchestration loop and session store that
@@ -253,7 +253,7 @@ app/
   logging_setup.py  JSON logs with per-request correlation ids
   prompts.py      all prompt text
   static/index.html
-tests/            118 offline tests (DuckDB stands in for Snowflake, scripted LLM)
+tests/            122 offline tests (DuckDB stands in for Snowflake, scripted LLM)
 evals/            live end-to-end cases (real Claude + Snowflake) + runner
 scripts/          snowflake_setup.sql, inspect_schema.py
 ```
@@ -286,16 +286,21 @@ uv run python -m evals.run_evals     # live, costs a few cents; needs .env
 ```
 
 **Latest live run** (2026-10-10, Claude Opus 5.5 agent, Haiku 5.5 guardrail and verifier):
-- 25/25 cases passed. Median turn 12.2 s, slowest 22.7 s; guardrail rejections ~2 s.
-- About 3¢ per answered question; ~97% of input tokens served from the prompt cache.
-- The verifier passed 16 answers and flagged one: a *false* alarm, because it only received SQL results, not the place-lookup result the answer quoted. Fixed by passing it every tool result; regression test `test_verifier_gets_non_sql_tool_results_too`.
+- 26/26 cases passed. Median turn 13.5 s, slowest 37.5 s (all 52 states with a median estimate each); guardrail rejections ~2 s.
+- About 4¢ per answered question; ~97% of input tokens served from the prompt cache.
+- The verifier passed all 17 answers that stated figures.
+
+Earlier runs found real problems, each now covered by a test or eval case:
+- **Verifier false alarm.** It was only given SQL results, so a true count from the place lookup looked unsupported. Fixed by passing it every tool result; regression test `test_verifier_gets_non_sql_tool_results_too`.
+- **"All states" timeout on the live demo.** Fixed with graceful degradation at the deadline, SQL-side per-row maths, and a FIPS-table join for state names. Eval case `all_states_wide_answer`.
+- **A biased median estimate.** Averaging block-group medians overstated state medians by ~15%; the agent now interpolates within income brackets, within ~1% of published figures.
 
 CI (`.github/workflows/ci.yml`) runs on every push:
 - lint, format check, mypy and the offline tests against the locked dependencies;
 - a Docker build, then a boot smoke test with no credentials, which must come up in degraded mode.
 
 - **Offline suite (`tests/`).** Deterministic and runs in CI. DuckDB is seeded with a miniature copy of the share, using the same table and column names, so tools and the agent run real SQL. A scripted LLM replays tool calls, which tests the loop's behaviour: SQL errors fed back for retry, a database outage mid-turn, deadlines, step limits, the grounding retry, refusals, history validity after failures, guardrail routing and fail-open. A separate set of tests covers the SQL validator against injection and escape attempts.
-- **Live evals (`evals/cases.yaml`).** 25 cases across categories: lookups, ratios, rankings, the median caveat, multi-turn, multi-year comparisons (with the overlap and dollar caveats), ambiguity, partial matches, unanswerable, off-topic and adversarial. Numeric answers are checked against hand-written ground-truth SQL that the runner executes directly, independent of the agent. The runner also checks the 60 s limit per turn.
+- **Live evals (`evals/cases.yaml`).** 26 cases across categories: lookups, ratios, rankings, the median caveat, multi-turn, multi-year comparisons (with the overlap and dollar caveats), ambiguity, partial matches, unanswerable, off-topic and adversarial. Numeric answers are checked against hand-written ground-truth SQL that the runner executes directly, independent of the agent. The runner also checks the 60 s limit per turn.
 
 ## Deploying
 

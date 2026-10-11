@@ -355,3 +355,62 @@ async def test_verifier_gets_non_sql_tool_results_too(executor, settings):
     )
     await make_agent(llm, executor, settings).answer(Session(id="s"), "Population of Washington?", Recorder())
     assert "resolve_geography" in llm.verify_inputs[0] and "candidates" in llm.verify_inputs[0]
+
+
+# ---- graceful degradation at the deadline -------------------------------------
+
+
+class _StallAfterStreaming(ScriptedLLM):
+    """Scripted steps, except the final step streams `partial` and then stalls past the deadline."""
+
+    def __init__(self, steps, partial: str):
+        super().__init__(steps=steps)
+        self.partial = partial
+
+    async def agent_turn(self, *, system, messages, tools, on_text):
+        if self.steps:
+            return await super().agent_turn(system=system, messages=messages, tools=tools, on_text=on_text)
+        await on_text(self.partial)
+        await asyncio.sleep(10)
+        raise AssertionError("should have hit the deadline")
+
+
+async def test_deadline_after_query_returns_the_data_instead_of_an_apology(executor, settings):
+    settings.request_deadline_s, settings.wrap_up_at_s, settings.min_step_s = 1.5, 0.2, 0.1
+    llm = _StallAfterStreaming(steps=[tool_turn(("run_sql", {"sql": TX_SQL, "purpose": "Texas population"}))], partial="")
+    session, rec = Session(id="s"), Recorder()
+    stats = await make_agent(llm, executor, settings).answer(session, "Population of Texas?", rec)
+    assert stats.outcome == "timeout_partial"
+    assert (
+        "query had already finished" in rec.visible_text and "| pop |" in rec.visible_text.lower() and "6,000" in rec.visible_text
+    )
+    assert_valid_history(session.api_messages)
+    assert session.transcript[-1][1] == rec.visible_text
+
+
+async def test_deadline_mid_answer_keeps_what_was_written(executor, settings):
+    settings.request_deadline_s, settings.wrap_up_at_s, settings.min_step_s = 1.5, 0.2, 0.1
+    partial = "Here is the population of every state. " * 8  # > 200 chars
+    llm = _StallAfterStreaming(steps=[tool_turn(("run_sql", {"sql": TX_SQL, "purpose": "x"}))], partial=partial)
+    rec = Recorder()
+    stats = await make_agent(llm, executor, settings).answer(Session(id="s"), "All states?", rec)
+    assert stats.outcome == "timeout_partial"
+    assert rec.visible_text.startswith(partial.strip()) and "hit the time limit" in rec.visible_text
+
+
+async def test_short_narration_at_deadline_is_not_passed_off_as_an_answer(executor, settings):
+    settings.request_deadline_s, settings.wrap_up_at_s, settings.min_step_s = 1.5, 0.2, 0.1
+    llm = _StallAfterStreaming(steps=[], partial="Let me look that up.")
+    rec = Recorder()
+    stats = await make_agent(llm, executor, settings).answer(Session(id="s"), "q?", rec)
+    assert stats.outcome == "timeout" and rec.visible_text == MSG_TIMEOUT
+
+
+@pytest.mark.filterwarnings("ignore::pytest.PytestWarning")
+def test_markdown_table_formats_and_caps_rows():
+    from app.agent import _markdown_table
+
+    out = _markdown_table(["STATE", "POP", "SHARE"], [["48", 28635442, 0.2051], ["39", 11675275, 0.18]])
+    assert "| 48 | 28,635,442 | 0.21 |" in out
+    big = _markdown_table(["N"], [[i] for i in range(100)], max_rows=10)
+    assert "Showing 10 of 100 rows" in big

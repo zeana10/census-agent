@@ -94,6 +94,29 @@ me two things CI couldn't:
   update the running service's environment variables. I only noticed because
   `/healthz` reports the live value.
 
+**9. Someone else tried it.** The first person outside the project to use the
+live demo asked for "population of all states and median income", and got
+"Sorry, that question took too long". All my tests had been about one or two
+places. When I reproduced it, three separate things turned up:
+- **It threw away good data.** The query had finished in 2 seconds; it was
+  writing a 52-row answer that ran past the deadline. Then the app replaced
+  everything with an apology. Now, when the deadline hits, it keeps whatever
+  answer it has written so far, or shows the query's results as a table. It
+  only apologises when there's genuinely nothing to show.
+- **It spent its time badly.** It worked out each state's median while writing
+  the answer, and in one run it looked up all 53 state names one tool call at a
+  time. The prompt now says to do per-row maths in SQL and to join the state
+  names table in the same query.
+- **One of its estimates was wrong.** Averaging block-group medians, which my
+  own prompt had suggested, overstated California and Texas by about 15%.
+  Interpolating within the income brackets lands within about 1% of the
+  published figures. The prompt now requires that method.
+
+Same question, after the fixes: about 35–45 seconds, accurate medians, and it's
+now eval case 26. The lesson is the uncomfortable one: my eval set reflected the
+questions *I* thought to ask, and the first other person found a gap in a few
+minutes.
+
 ### Mistakes I'd call out
 
 Most of these were bugs in code Claude wrote that I didn't catch on the first
@@ -196,7 +219,7 @@ I split testing by what each kind of test is good at:
 - **The agent loop's control flow, tested offline** with a scripted model.
 - **Answer quality, tested live** against real data.
 
-**Offline (118 tests, about 7 seconds, no credentials).** These cover:
+**Offline (122 tests, about 10 seconds, no credentials).** These cover:
 - the SQL validator against injection and escape attempts;
 - schema discovery, field search and place lookup, including ambiguous names;
 - the agent loop under failure: SQL errors, the database dropping mid-turn,
@@ -210,16 +233,16 @@ no credentials.
 The trade-off is that the offline tests run on DuckDB, not Snowflake.
 Snowflake-specific SQL problems only show up live.
 
-**Live (25 cases, about 8 minutes, about 75¢).** These are lookups, ratios,
+**Live (26 cases, about 8 minutes, about 75¢).** These are lookups, ratios,
 rankings, follow-ups, year comparisons, ambiguous and unanswerable questions,
 and adversarial ones. For the cases with a specific number, the runner works
 out the right answer with its own hand-written SQL, independent of the agent,
 and checks the answer matches.
-- **Results:** 24/24 on the first run; 25/25 on the latest, with the verifier
+- **Results:** 24/24 on the first run; 26/26 on the latest, with the verifier
   switched on.
-- **Speed:** median turn 12 seconds, slowest 23. Guardrail rejections about
+- **Speed:** median turn about 13 seconds, slowest about 38 (every state at once). Guardrail rejections about
   2 seconds.
-- **Cost:** about 3 cents per answered question, with most of the prompt
+- **Cost:** about 4 cents per answered question, with most of the prompt
   served from cache.
 
 The evals passing isn't the whole story, though. They passed while the stale

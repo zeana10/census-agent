@@ -222,7 +222,30 @@ Two decisions came out of the deployment:
 I deployed late in the day. Next time I'd deploy a bare skeleton first, since
 both of these were cheap to fix and only showed up on the real platform.
 
-### 17. Things I chose not to do (yet)
+### 17. Degrade at the deadline instead of apologising, and fix how medians are estimated
+
+The first outside tester asked for "population of all states and median income"
+and got a timeout, even though the query had finished in 2 seconds. Three
+decisions came out of it:
+- **What happens at the deadline.** If time runs out, keep what's been written
+  (with a note that it was cut short and not double-checked), or show the query
+  results as a plain table. Only apologise when there's nothing at all. The old
+  behaviour, throwing away finished work, was the opposite of "degrade
+  gracefully".
+- **Where per-row work happens.** For questions covering many places, the
+  agent now does the arithmetic in SQL and joins the FIPS table for state names,
+  instead of calculating while writing or looking each state up separately.
+- **How medians are estimated.** I'd suggested averaging block-group medians.
+  Checked against published figures, that was about 15% too high for California
+  and Texas. Interpolating within the income brackets is within about 1%, so
+  that's now required. I also stopped the prompt from quoting that accuracy
+  figure, because the agent started repeating it to users as if it were data,
+  and the verifier rightly flagged it.
+
+The question is now an eval case, and its check would fail if the biased median
+came back.
+
+### 18. Things I chose not to do (yet)
 
 - **Durable conversation storage.** Memory is fine for a one-instance demo;
   Redis would be the next step.

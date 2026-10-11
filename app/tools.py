@@ -62,7 +62,8 @@ TOOL_DEFS: list[dict] = [
     _tool(
         "resolve_geography",
         "Resolve a US state or county name to its GEOID prefix and a ready-to-use SQL filter on CENSUS_BLOCK_GROUP. "
-        "Returns several candidates if the name is ambiguous. Cities, ZIP codes and neighborhoods are not available.",
+        "Returns several candidates if the name is ambiguous. Cities, ZIP codes and neighborhoods are not available. "
+        "For one or a few named places only; to put names on many result rows, join the FIPS codes table in SQL.",
         {"place": {"type": "string", "description": "e.g. 'Texas', 'Cook County, IL', 'King County WA', 'United States'."}},
         ["place"],
     ),

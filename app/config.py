@@ -44,6 +44,8 @@ class Settings(BaseSettings):
 
     # --- Limits ----------------------------------------------------------
     request_deadline_s: float = 50.0  # hard budget per user turn (spec: < 60 s)
+    wrap_up_at_s: float = 12.0  # with this little time left, tell the model to answer with what it has
+    min_step_s: float = 3.0  # don't start a model step with less time than this
     sql_timeout_s: int = 25
     max_result_rows: int = 200
     max_agent_steps: int = 10

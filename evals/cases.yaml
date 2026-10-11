@@ -160,3 +160,13 @@
   turns: ["How did Florida's population change between 2019 and 2020?", "Population of Washington?"]
   expect_any: ["Washington"]
   expect_none: ["2015–2019", "2015-2019"]
+
+- id: all_states_wide_answer
+  category: wide_answer
+  # Regression: this timed out on the live demo. 52 rows with a per-row median estimate.
+  turns: ["give population of all states and median income"]
+  min_queries: 1
+  expect_any: ["estimat", "interpolat"]
+  # The bracket-interpolation estimate for Texas is about $64,3xx; averaging block-group
+  # medians gives about $74,3xx (16% high) and must not appear.
+  expect_none: ["74,3", "took too long"]
