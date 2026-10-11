@@ -282,4 +282,5 @@ def test_unwritable_state_path_degrades_instead_of_crashing(settings, warehouse,
 def test_healthz_reports_where_state_is_kept(settings, warehouse):
     with _client(settings, warehouse, ScriptedLLM()) as c:
         state = c.get("/healthz").json()["state"]
-        assert state == {"store": "file", "path": settings.state_db_path}
+        assert state["store"] == "file" and state["path"] == settings.state_db_path
+        assert isinstance(state["on_mounted_volume"], bool)

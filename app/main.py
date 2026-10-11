@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
 import secrets
 import sqlite3
 import time
@@ -237,7 +238,13 @@ def create_app(settings: Settings | None = None, *, runtime: Runtime | None = No
                 # Where conversations and memories are kept. "file" plus the path tells you whether that's the
                 # persistent disk (e.g. /var/data/...) or the container's own, wiped-on-deploy filesystem;
                 # "memory" means the file couldn't be opened (the app keeps working either way).
-                "state": {"store": request.app.state.state_mode, "path": settings.state_db_path},
+                "state": {
+                    "store": request.app.state.state_mode,
+                    "path": settings.state_db_path,
+                    # True only when the database's folder is a mounted volume (e.g. a Render disk), i.e. it
+                    # survives deploys. False means the container's own filesystem: wiped on every deploy.
+                    "on_mounted_volume": _on_mount(settings.state_db_path),
+                },
                 "proxy": {
                     "forwarded_for_entries": len(xff),
                     "client_ip_headers": client_ip_headers,
@@ -390,6 +397,17 @@ def create_app(settings: Settings | None = None, *, runtime: Runtime | None = No
         return {"session_id": sessions.get_or_create(None, cid).id}
 
     return app
+
+
+def _on_mount(path: str) -> bool:
+    if path == ":memory:":
+        return False
+    p = os.path.dirname(os.path.abspath(path))
+    while p and p != os.path.dirname(p):
+        if os.path.ismount(p):
+            return True
+        p = os.path.dirname(p)
+    return False  # only "/" itself, which is the container's filesystem
 
 
 def _open_store(path: str) -> tuple[StateStore, str]:
