@@ -52,6 +52,19 @@
   .rtable-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; flex-wrap: wrap;
                  padding: 8px 10px; background: var(--code); font-size: 13px; }
   .rtable-head .title { font-weight: 600; }
+  .head-actions { display: flex; gap: 8px; }
+  .memnote { margin-top: 8px; font-size: 12px; color: var(--muted); }
+  #mempanel { position: fixed; top: 64px; right: 16px; width: min(380px, calc(100vw - 32px)); max-height: 70vh; overflow: auto;
+              background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; z-index: 5;
+              box-shadow: 0 8px 24px rgba(0,0,0,.12); display: none; }
+  #mempanel.open { display: block; }
+  #mempanel h2 { font-size: 14px; margin: 0 0 4px; }
+  #mempanel .hint { font-size: 12px; color: var(--muted); margin: 0 0 10px; }
+  #mempanel ul { list-style: none; padding: 0; margin: 0 0 10px; }
+  #mempanel li { display: flex; gap: 8px; align-items: flex-start; justify-content: space-between; padding: 6px 0;
+                 border-bottom: 1px solid var(--border); font-size: 13px; }
+  #mempanel li .kind { color: var(--muted); font-size: 11px; display: block; }
+  #mempanel button { background: none; border: 1px solid var(--border); color: var(--text); border-radius: 8px; padding: 2px 8px; font-size: 12px; }
   .rtable-head .dl { display: flex; gap: 6px; }
   .rtable-head a { border: 1px solid var(--border); border-radius: 8px; padding: 3px 10px; color: var(--text);
                    text-decoration: none; background: var(--panel); font-size: 12px; }
@@ -66,8 +79,17 @@
 <body>
 <header>
   <div><h1>Census Assistant</h1><div class="sub">ACS 5-year estimates, 2019 and 2020 releases · US, states and counties (no city or ZIP data) · Snowflake Marketplace</div></div>
-  <button class="ghost" id="newchat" type="button">New chat</button>
+  <div class="head-actions">
+    <button class="ghost" id="memorybtn" type="button" aria-expanded="false" aria-controls="mempanel">Memory</button>
+    <button class="ghost" id="newchat" type="button">New chat</button>
+  </div>
 </header>
+<aside id="mempanel" aria-label="What the assistant remembers">
+  <h2>What I remember about you</h2>
+  <p class="hint">Saved when you tell me a lasting preference (e.g. "default to 2019", "I focus on Texas"). Only this browser sees it.</p>
+  <ul id="memlist"></ul>
+  <button type="button" id="memclear">Forget everything</button>
+</aside>
 <main id="log">
   <div class="msg" id="intro">
     <p>Ask me about US population and demographics: age, race and ethnicity, income, poverty, education, housing, commuting and more, for the whole country, a state, or a county, from the 2019 (2015–2019) and 2020 (2016–2020) American Community Survey releases. Cities and ZIP codes aren't in the data, so I'll offer the county instead. Every number comes from a live query, and you can expand <em>How I got this</em> to see the SQL.</p>
@@ -92,6 +114,13 @@ const input = document.getElementById('input');
 const sendBtn = document.getElementById('send');
 let sessionId = null;
 try { sessionId = localStorage.getItem('census_session'); } catch (e) {}
+// A random id for this browser: scopes conversations and long-term memory. Not a login.
+let clientId = null;
+try { clientId = localStorage.getItem('census_client'); } catch (e) {}
+if (!/^[0-9a-f]{32}$/.test(clientId || '')) {
+  clientId = Array.from(crypto.getRandomValues(new Uint8Array(16)), b => b.toString(16).padStart(2, '0')).join('');
+  try { localStorage.setItem('census_client', clientId); } catch (e) {}
+}
 let busy = false;
 let controller = null;
 // Outcomes where the answer is an apology rather than an answer: offer a retry.
@@ -199,7 +228,7 @@ async function ask(question) {
   try {
     const resp = await fetch('/api/chat', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ session_id: sessionId, message: question }),
+      body: JSON.stringify({ session_id: sessionId, client_id: clientId, message: question }),
       signal: controller.signal,
     });
     if (!resp.ok || !resp.body) throw new Error('HTTP ' + resp.status);
@@ -225,6 +254,7 @@ async function ask(question) {
         else if (ev === 'replace') { m.text = d.text; render(m); }
         else if (ev === 'sql') m.queries.push(d);
         else if (ev === 'table') addTable(m, d);
+        else if (ev === 'memory') addMemoryNote(m, d);
         else if (ev === 'done') { setStatus(m, ''); addQueries(m); outcome = d.outcome; requestId = d.request_id; }
       }
     }
@@ -258,20 +288,61 @@ input.addEventListener('input', autosize);
 document.querySelectorAll('.examples button').forEach(b => b.addEventListener('click', () => ask(b.textContent)));
 document.getElementById('newchat').addEventListener('click', async () => {
   if (busy) return;
-  const r = await fetch('/api/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: sessionId || '' }) });
+  const r = await fetch('/api/reset', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: sessionId || '', client_id: clientId }) });
   if (r.ok) { saveSession((await r.json()).session_id); location.reload(); }
+});
+
+// ---- long-term memory ----------------------------------------------------------
+function addMemoryNote(m, d) {
+  const n = document.createElement('div'); n.className = 'memnote';
+  n.textContent = d.action === 'saved' ? 'Saved to memory: ' + d.memory.text : 'Removed from memory.';
+  m.el.insertBefore(n, m.st);
+  if (document.getElementById('mempanel').classList.contains('open')) loadMemories();
+}
+async function loadMemories() {
+  const list = document.getElementById('memlist'); list.textContent = '';
+  try {
+    const r = await fetch('/api/memory?client_id=' + clientId);
+    const { memories } = await r.json();
+    if (!memories.length) { const li = document.createElement('li'); li.textContent = 'Nothing yet.'; list.appendChild(li); }
+    for (const mem of memories) {
+      const li = document.createElement('li');
+      const text = document.createElement('span');
+      const kind = document.createElement('span'); kind.className = 'kind'; kind.textContent = mem.kind;
+      text.append(kind, document.createTextNode(mem.text));
+      const del = document.createElement('button'); del.type = 'button'; del.textContent = 'Forget';
+      del.addEventListener('click', async () => {
+        await fetch('/api/memory/' + mem.id + '?client_id=' + clientId, { method: 'DELETE' }); loadMemories();
+      });
+      li.append(text, del); list.appendChild(li);
+    }
+  } catch (e) { const li = document.createElement('li'); li.textContent = 'Couldn\'t load memories.'; list.appendChild(li); }
+}
+document.getElementById('memorybtn').addEventListener('click', e => {
+  const panel = document.getElementById('mempanel');
+  const open = panel.classList.toggle('open');
+  e.currentTarget.setAttribute('aria-expanded', String(open));
+  if (open) loadMemories();
+});
+document.getElementById('memclear').addEventListener('click', async () => {
+  if (!confirm('Forget everything the assistant remembers about you?')) return;
+  await fetch('/api/memory?client_id=' + clientId, { method: 'DELETE' }); loadMemories();
 });
 
 // Restore an existing conversation after a page reload.
 (async () => {
   if (!sessionId) return;
   try {
-    const r = await fetch('/api/history?session_id=' + encodeURIComponent(sessionId));
+    const r = await fetch('/api/history?session_id=' + encodeURIComponent(sessionId) + '&client_id=' + clientId);
     if (!r.ok) return;
     const h = await r.json();
     saveSession(h.session_id);
     if (h.messages.length) document.getElementById('intro')?.remove();
-    for (const msg of h.messages) msg.role === 'user' ? addUser(msg.text) : addAssistant(msg.text);
+    for (const msg of h.messages) {
+      if (msg.role === 'user') { addUser(msg.text); continue; }
+      const m = addAssistant(msg.text);
+      for (const t of msg.tables || []) addTable(m, t);  // tables come back from the server's store
+    }
   } catch (e) {}
 })();
 </script>

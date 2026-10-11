@@ -13,7 +13,7 @@ from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol, cast
 
 import anthropic
-from anthropic.types.beta import BetaMessageParam, BetaToolParam
+from anthropic.types.beta import BetaMessageParam, BetaTextBlockParam, BetaToolParam
 from pydantic import BaseModel, Field
 
 from .config import Settings
@@ -61,7 +61,9 @@ class GroundingVerdict(BaseModel):
 
 
 class LLM(Protocol):
-    async def agent_turn(self, *, system: str, messages: list[dict], tools: list[dict], on_text: TextCallback) -> Turn: ...
+    async def agent_turn(
+        self, *, system: str, messages: list[dict], tools: list[dict], on_text: TextCallback, memory: str = ""
+    ) -> Turn: ...
 
     async def classify(self, *, system: str, transcript: str) -> GuardrailDecision: ...
 
@@ -77,20 +79,30 @@ class AnthropicLLM:
             max_retries=2,
         )
 
-    async def agent_turn(self, *, system: str, messages: list[dict], tools: list[dict], on_text: TextCallback) -> Turn:
+    async def agent_turn(
+        self, *, system: str, messages: list[dict], tools: list[dict], on_text: TextCallback, memory: str = ""
+    ) -> Turn:
+        # The stable prompt is cached; per-user memories come after the cache breakpoint,
+        # so saving a memory doesn't invalidate the cached schema overview.
+        system_blocks: list[BetaTextBlockParam] = [{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}]
+        if memory:
+            system_blocks.append({"type": "text", "text": memory})
         try:
             async with self._client.beta.messages.stream(
                 model=self._s.agent_model,
                 max_tokens=16000,
-                system=[{"type": "text", "text": system, "cache_control": {"type": "ephemeral"}}],
+                system=system_blocks,
                 messages=cast("list[BetaMessageParam]", messages),
                 tools=cast("list[BetaToolParam]", tools),
                 thinking={"type": "adaptive"},
                 output_config={"effort": self._s.agent_effort},
                 # If a safety classifier declines, the API re-runs the request on a fallback model
                 # instead of returning a refusal.
-                betas=["server-side-fallback-2026-07-01"],
+                betas=["server-side-fallback-2026-07-01", "compact-2026-01-12"],
                 fallbacks="default",
+                # Long conversations are summarised server-side instead of hitting the context limit.
+                # Compaction blocks come back in the content and are stored and resent unchanged.
+                context_management={"edits": [{"type": "compact_20260112"}]},
             ) as stream:
                 async for event in stream:
                     if event.type == "text":

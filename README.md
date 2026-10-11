@@ -36,7 +36,7 @@ Expand **How I got this** under any answer to see the exact SQL that produced it
 |---|---|---|---|
 | Chat agent grounded in the US Census data | Claude queries the Snowflake share through tools; every figure comes from a query run in the conversation | `agent.py`, `tools.py` | Every answer's *How I got this* panel; live evals with ground-truth SQL |
 | Public web UI, no local setup | One container on Render behind HTTPS and Basic auth | `Dockerfile`, `render.yaml`, `static/index.html` | Demo URL above |
-| Preserve conversation context | Full per-session history (including query results) sent each turn; short follow-ups inherit place, measure and year, new questions start fresh | `sessions.py`, `prompts.py` | `test_follow_up_sends_prior_turns`; 5 multi-turn eval cases |
+| Preserve conversation context | **Short-term:** full per-conversation history (including query results) sent each turn and saved to SQLite on a persistent disk, so it survives deploys and restarts; tables are restored on reload; very long conversations are condensed by API-side compaction. Short follow-ups inherit place, measure and year; new questions start fresh. **Long-term:** per-browser memories of stated preferences ("default to 2019", "I focus on Texas"), used in later conversations and shown in a Memory panel | `sessions.py`, `store.py`, `prompts.py`, `tools.py` | `test_follow_up_sends_prior_turns`, `test_memory.py` (restart, ownership, poisoning); 5 multi-turn eval cases |
 | Responses within 60 s | Streaming (SSE) with progress lines; 50 s hard deadline per turn, forced wrap-up at 12 s left, step cap | `agent.py`, `main.py` | `test_deadline_is_enforced`, `test_step_limit_forces_wrap_up`; eval runner fails any turn over 60 s |
 | Guardrails / dedicated validation layer | `guardrails.py`: input precheck, then an input classifier (fast-fail, no DB access), then output grounding checks (heuristic + LLM verifier); plus SQL allow-list and read-only role | `guardrails.py`, `sql_guard.py`, `snowflake_setup.sql` | Guardrail and verifier tests; 7 adversarial/off-topic eval cases |
 | Degrade gracefully, never hallucinate | Unanswerable → explains why + nearest answerable question; DB/LLM outages → specific message, retry button, request id; failed turns never corrupt history | `agent.py`, `warehouse.py`, `llm.py` | `test_warehouse_outage_…`, `test_llm_errors_are_user_safe`, degraded-mode API test |
@@ -44,7 +44,7 @@ Expand **How I got this** under any answer to see the exact SQL that produced it
 | Comprehensive mapping (no subset) | Catalog built from the share's own metadata: all 8,084 fields, 353 tables, both releases, no hard-coded columns | `catalog.py` | `scripts/inspect_schema.py`; catalog tests |
 | Context awareness of the schema | Table-level overview in the (cached) system prompt; field-level detail on demand via `search_fields` / `describe_table` | `catalog.py`, `tools.py` | Agent picks e.g. B15003e22–e25 or B19001 brackets unaided in evals |
 | Deployment "truth" | CI builds the image and boots it with no credentials (must come up degraded, not crash); background catalog load so health checks pass immediately | `.github/workflows/ci.yml` | CI run |
-| Meaningful tests | 133 offline tests (DuckDB stand-in for Snowflake, scripted model) + 27 live evals with independent ground truth | `tests/`, `evals/` | See *Tests* below |
+| Meaningful tests | 161 offline tests (DuckDB stand-in for Snowflake, scripted model) + 27 live evals with independent ground truth | `tests/`, `evals/` | See *Tests* below |
 
 ## Architecture
 
@@ -59,7 +59,7 @@ flowchart TB
         agent["Agent loop · app/agent.py<br/>50 s deadline · up to 10 steps<br/>a turn completes or never happened"]
         guard["Validation layer · app/guardrails.py<br/>in: precheck + classifier<br/>out: grounding checks"]
         tools["Tools · app/tools.py<br/>search_fields · describe_table<br/>resolve_geography · run_sql"]
-        sessions[("Conversations<br/>in memory")]
+        sessions[("SQLite on persistent disk<br/>conversations · tables<br/>per-browser memories")]
         catalog[("Schema catalog<br/>8,084 fields · 353 tables<br/>2019 + 2020")]
         sqlcheck["SQL check · app/sql_guard.py<br/>one SELECT · census tables only · row cap"]
     end
@@ -207,7 +207,7 @@ job inside the account. I considered each piece:
 
 **Why the trade-off favours the current design for this brief.**
 1. **Comprehensive coverage.** The schema is reached through retrieval tools over the share's own metadata, so every column can be answered without curating a subset first.
-2. **Control and testability.** Every step — guardrail, retrieval, SQL validation, deadline, grounding check — is ordinary Python. That's why 133 offline tests can pin down its behaviour.
+2. **Control and testability.** Every step — guardrail, retrieval, SQL validation, deadline, grounding check — is ordinary Python. That's why 161 offline tests can pin down its behaviour.
 3. **Model quality.** Correct aggregation (never summing medians, matching numerator and denominator universes) is mostly a reasoning problem, so I wanted the strongest current model.
 
 **What it costs.** I maintain an orchestration loop and session store that
@@ -250,12 +250,13 @@ app/
   geography.py    state/county resolution
   sql_guard.py    static SQL validation
   warehouse.py    Snowflake access, error mapping, reconnects
-  sessions.py     in-memory conversation store
+  sessions.py     conversations (short-term memory), saved through store.py
+  store.py        SQLite: conversations, result tables, per-browser memories (long-term)
   logging_setup.py  JSON logs with per-request correlation ids
   prompts.py      all prompt text
   export.py       Excel/CSV downloads for result tables
   static/index.html
-tests/            133 offline tests (DuckDB stands in for Snowflake, scripted LLM)
+tests/            161 offline tests (DuckDB stands in for Snowflake, scripted LLM)
 evals/            live end-to-end cases (real Claude + Snowflake) + runner
 scripts/          snowflake_setup.sql, inspect_schema.py
 ```
@@ -288,9 +289,9 @@ uv run python -m evals.run_evals     # live, costs a few cents; needs .env
 ```
 
 **Latest live run** (2026-10-10, Claude Opus 5.5 agent, Haiku 5.5 guardrail and verifier):
-- 27/27 cases passed. Median turn 13.3 s, slowest 40.1 s; guardrail rejections ~2 s. Listing every county (3,221 rows, shown as a full table) takes about 21 s.
+- 27/27 cases passed. Median turn 10.0 s, slowest 40.1 s; guardrail rejections ~2 s.
 - About 5¢ per answered question; ~97% of input tokens served from the prompt cache.
-- The verifier checked 19 answers: 18 passed (three after one retry) and one went out with its caveat. That one was the agent rightly noticing the 2019 tables were mislabelled as 2020 dollars, a catalog bug now fixed.
+- The verifier checked 19 answers: 18 passed and 1 went out with its caveat. That one was a real catch: the summary called Baltimore one of "Virginia's independent cities" (it's in Maryland), a detail the model added from general knowledge rather than the data.
 
 Earlier runs found real problems, each now covered by a test or eval case:
 - **Verifier false alarm.** It was only given SQL results, so a true count from the place lookup looked unsupported. Fixed by passing it every tool result; regression test `test_verifier_gets_non_sql_tool_results_too`.
@@ -318,4 +319,5 @@ catalog load is retried every 30 s.
 - **Logs** are JSON on stdout. Each chat request has a `request_id`, returned in the `X-Request-ID` header and the final SSE event; filter on it to see one turn end to end (guardrail decision, each model step with its Anthropic request id, each SQL query, outcome and latency).
 - **Snowflake connection pool:** `SNOWFLAKE_POOL_SIZE` (default 4) caps concurrent queries. Keep it at or below the warehouse's concurrency level.
 - **Rate limits** have three layers, all per rolling minute: 10 messages per browser session (so reviewers sharing an office IP don't block each other), 60 per IP (so a client can't get around the session limit by inventing session IDs), and 120 overall as a cost ceiling. Settings: `RATE_LIMIT_PER_SESSION_PER_MINUTE`, `RATE_LIMIT_PER_IP_PER_MINUTE`, `RATE_LIMIT_GLOBAL_PER_MINUTE`.
+- **State** (conversations, result tables, memories) is SQLite at `STATE_DB_PATH`; on Render that's `/var/data/state.db` on a 1 GB persistent disk declared in `render.yaml`. `/healthz` reports `"state": "durable"`, or `"ephemeral"` if the file couldn't be opened, in which case the app keeps working with in-memory state and logs an error. Conversations untouched for 30 days are deleted at startup; memories are kept until the user deletes them.
 - **Client IPs for rate limiting** come from `X-Forwarded-For`, using only entries appended by the `TRUSTED_PROXY_HOPS` proxies in front of the app. On Render this is **2** (Cloudflare, then Render's load balancer; measured with `/healthz`, which reports the number of forwarded entries). Entries a client adds itself are ignored. On a new host, call `/healthz` directly and set the value to its `forwarded_for_entries`.

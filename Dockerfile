@@ -12,7 +12,9 @@ RUN uv sync --frozen --no-dev --no-install-project
 COPY app ./app
 COPY scripts ./scripts
 
-RUN useradd --create-home appuser && chown -R appuser /app
+# /var/data is where Render mounts the persistent disk (render.yaml). Owning it as appuser helps if the
+# mount keeps the directory's ownership; if not, the app falls back to in-memory state (see /healthz "state").
+RUN useradd --create-home appuser && mkdir -p /var/data && chown -R appuser /app /var/data
 USER appuser
 ENV PATH="/app/.venv/bin:$PATH"
 

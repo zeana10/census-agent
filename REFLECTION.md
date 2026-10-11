@@ -127,6 +127,17 @@ the summary. The verifier earned its keep on the first run of this too: the
 model guessed that Puerto Rico was "probably" included, the verifier flagged
 the guess, and the retry ran a query to check before saying so.
 
+**11. Memory.** Every deploy I did today silently wiped every open
+conversation, because they lived in server memory. Now conversations, their
+tables and per-browser long-term memories are saved to SQLite on a persistent
+disk. The test I cared about was a real restart: the page brought the
+conversation back, and the follow-up "And in 2020?" still worked. That only
+works if the model's signed thinking blocks survive being saved and reloaded
+exactly. Long-term memory came with a security question I hadn't considered
+until I designed it: anything saved there is shown to the model in every future
+conversation, so it's a place to plant instructions. That's why memories are
+validated, framed as data, capped, and visible to the user.
+
 ### Mistakes I'd call out
 
 Most of these were bugs in code Claude wrote that I didn't catch on the first
@@ -193,8 +204,9 @@ hardest:
 6. **Evals that judge quality, not just keywords.** My checks are numbers,
    keywords and outcomes. They passed while the stale carry-forward was
    happening. An LLM-graded pass would have caught it.
-7. **Durable conversations.** They live in memory, so a restart loses them and
-   I can only run one instance. Redis would fix both.
+7. **Scale-out state.** Conversations and memories are now durable, but in
+   SQLite on a single disk, so the app is still one instance. Postgres would
+   allow more.
 8. **Proper accounts** instead of one shared demo login, with per-user limits.
 
 ## Edge cases I know about but didn't fully solve
@@ -216,9 +228,17 @@ hardest:
   times out, the answer still goes out (unverified, and logged). I chose
   availability over strictness for a demo; a customer deployment might choose
   differently.
-- **Long conversations** stop at 20 turns rather than being summarised.
-- **Rate limits and sessions reset on every deploy,** because they're in
-  memory.
+- **Compaction is untested at real length.** Long conversations should be
+  condensed by the API's compaction feature well before the 50-turn backstop,
+  but none of my tests got near the size where it triggers.
+- **Memory is only as good as the browser ID.** Clearing browser storage or
+  switching browsers starts a fresh memory; people sharing a browser share one.
+  Real accounts would fix that.
+- **Memory-poisoning defences are heuristics.** Instruction-like text is
+  rejected and memories are framed as data, but a carefully worded note could
+  still slip a nudge through. It can't touch the SQL safety layers or the data,
+  though, and the user can always see and delete it.
+- **Rate limits reset on every deploy,** because they're in memory.
 - **Costs** are capped by Snowflake's resource monitor and an Anthropic spend
   limit. There's no per-user budget.
 
@@ -229,7 +249,7 @@ I split testing by what each kind of test is good at:
 - **The agent loop's control flow, tested offline** with a scripted model.
 - **Answer quality, tested live** against real data.
 
-**Offline (133 tests, about 13 seconds, no credentials).** These cover:
+**Offline (161 tests, about 15 seconds, no credentials).** These cover:
 - the SQL validator against injection and escape attempts;
 - schema discovery, field search and place lookup, including ambiguous names;
 - the agent loop under failure: SQL errors, the database dropping mid-turn,

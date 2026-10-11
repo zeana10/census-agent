@@ -14,3 +14,5 @@ fix_app_key.sql
 .DS_Store
 .ruff_cache/
 .mypy_cache/
+state.db
+state.db-*

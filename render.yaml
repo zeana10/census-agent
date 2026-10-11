@@ -5,6 +5,13 @@ services:
     runtime: docker
     plan: starter          # free plan sleeps after inactivity; starter stays warm for reviewers
     healthCheckPath: /healthz
+    # Conversations, result tables and long-term memories live in SQLite on this disk, so they
+    # survive deploys and restarts. (A disk pins the service to one instance and adds a few
+    # seconds of downtime per deploy; fine for this app, which is single-instance anyway.)
+    disk:
+      name: state
+      mountPath: /var/data
+      sizeGB: 1
     envVars:
       - key: ANTHROPIC_API_KEY
         sync: false
@@ -26,6 +33,8 @@ services:
       # X-Forwarded-For, so the visitor's IP is the 2nd entry from the right.
       - key: TRUSTED_PROXY_HOPS
         value: "2"
+      - key: STATE_DB_PATH
+        value: /var/data/state.db
       - key: BASIC_AUTH_USER
         value: reviewer
       - key: BASIC_AUTH_PASSWORD

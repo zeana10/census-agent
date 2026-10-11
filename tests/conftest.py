@@ -17,6 +17,7 @@ def settings(tmp_path) -> Settings:
         snowflake_schema=SCHEMA,
         census_years=",".join(YEARS),
         catalog_cache_path=str(tmp_path / "catalog.json"),
+        state_db_path=str(tmp_path / "state.db"),  # each test gets its own database
         request_deadline_s=50,
         max_agent_steps=6,
         rate_limit_per_session_per_minute=100,

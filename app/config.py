@@ -52,7 +52,7 @@ class Settings(BaseSettings):
     tables_per_session: int = 20  # oldest downloadable tables are dropped beyond this
     max_agent_steps: int = 10
     max_question_chars: int = 2000
-    max_history_turns: int = 20
+    max_history_turns: int = 50  # hard stop; long histories are condensed by API-side compaction well before this
     session_ttl_s: int = 60 * 60 * 6
     # Messages per rolling minute. See TieredLimiter in main.py for why there are three.
     rate_limit_per_session_per_minute: int = 10
@@ -66,6 +66,9 @@ class Settings(BaseSettings):
     basic_auth_user: str = ""  # leave empty to disable auth (local dev only)
     basic_auth_password: str = ""
     catalog_cache_path: str = "catalog_cache.json"
+    state_db_path: str = "state.db"  # SQLite file; on Render it lives on the persistent disk
+    conversation_ttl_days: int = 30  # conversations untouched this long are deleted at startup
+    memories_per_client: int = 20
     log_level: str = "INFO"
     log_format: Literal["json", "text"] = "json"  # "text" is easier to read locally
 

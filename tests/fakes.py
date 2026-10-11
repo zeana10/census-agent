@@ -278,9 +278,11 @@ class ScriptedLLM:
     # Verdicts returned by verify(), in order; once used up, every answer passes.
     verdicts: list[GroundingVerdict | Exception] = field(default_factory=list)
     verify_inputs: list[str] = field(default_factory=list)
+    memories_seen: list[str] = field(default_factory=list)  # the memory block passed on each model call
 
-    async def agent_turn(self, *, system: str, messages: list[dict], tools: list[dict], on_text) -> Turn:
+    async def agent_turn(self, *, system: str, messages: list[dict], tools: list[dict], on_text, memory: str = "") -> Turn:
         self.requests.append([dict(m) for m in messages])
+        self.memories_seen.append(memory)
         if self.turn_delay_s:
             await asyncio.sleep(self.turn_delay_s)
         if not self.steps:

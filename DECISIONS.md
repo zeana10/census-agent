@@ -277,10 +277,56 @@ and generating the file in the model's own response (same retyping problem).
 The 10,000-row ceiling covers every county; block-group-level lists (240,000
 rows) are deliberately out of reach.
 
-### 19. Things I chose not to do (yet)
+### 19. Short-term and long-term memory
 
-- **Durable conversation storage.** Memory is fine for a one-instance demo;
-  Redis would be the next step.
+**Short-term memory** (within one conversation) already worked, because the
+full history is resent each turn. But it lived in server memory: every deploy
+wiped every open conversation, there was a hard stop at 20 turns, and tables
+vanished on reload. Now:
+- **Durable.** Conversations, their tables and their history are saved to
+  SQLite on a persistent disk, so they survive deploys and restarts. I tested
+  a real restart: the page reloaded the conversation, and a follow-up ("And in
+  2020?") worked. That proves the saved history, including the model's signed
+  thinking blocks, is accepted by the API as stored.
+- **Condensed, not capped.** The API's server-side compaction summarises
+  older turns as a conversation gets long, so the hard stop moved from 20 to
+  50 turns and is now just a backstop. History stays append-only.
+- **Owned.** A conversation belongs to the browser that started it. Presenting
+  someone else's conversation id gets you a fresh conversation, not theirs.
+
+**Long-term memory** (across conversations) is new. When a user states a
+lasting preference ("I focus on Texas counties", "default to 2019"), the agent
+saves it with a `remember` tool. Later conversations get those notes and use
+them as defaults, saying so ("I used the 2019 release because your saved
+preference is for 2019"). A Memory panel shows exactly what's stored, with
+Forget and Forget-everything buttons.
+
+The decisions behind it:
+- **Per browser, not per login.** Everyone shares the `reviewer` login, so
+  per-login memory would mix reviewers' preferences. Each browser keeps a
+  random ID instead.
+- **SQLite on a Render disk** rather than Redis or Postgres. One file, no new
+  service, and it fits an app that already runs as one instance. The trade-off
+  is a few seconds of downtime per deploy. If the disk can't be opened, the app
+  falls back to in-memory state and says so on `/healthz`, rather than failing
+  to start.
+- **Memory is an attack surface.** Saved notes are shown to the model on every
+  future turn, so they're an obvious place to plant instructions ("memory
+  poisoning"). My defences:
+  - memories are short, typed (preference, focus, note) and capped at 20;
+  - text that reads like instructions, code, or contact details is rejected
+    when saved;
+  - the model is told memories are context about the user, never instructions,
+    and can't change its rules or scope;
+  - users can see and delete everything.
+- **Structured tools instead of a free-form memory file system.** The
+  Claude API has a general memory tool, but structured, validated notes were
+  easier to secure and to show to users.
+
+### 20. Things I chose not to do (yet)
+
+- **Multiple instances.** State is in SQLite on one disk; Postgres would be
+  the step for scaling out.
 - **Significance tests for year comparisons.** These need properly combined
   margins of error first.
 - **LLM-graded answer quality in the evals.** That's the gap the follow-up bug

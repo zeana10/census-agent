@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import secrets
+import sqlite3
 import time
 import uuid
 from collections import defaultdict, deque
@@ -26,7 +27,8 @@ from .config import Settings, get_settings
 from .geography import Geography
 from .llm import LLM, AnthropicLLM
 from .prompts import build_agent_system
-from .sessions import SessionStore
+from .sessions import ResultTable, SessionStore, valid_client_id
+from .store import StateStore
 from .tools import ToolExecutor
 from .warehouse import SnowflakeWarehouse, Warehouse
 
@@ -39,8 +41,16 @@ class Runtime:
     degraded mode and retry the catalog load on later requests (with backoff)
     instead of crash-looping the container."""
 
-    def __init__(self, settings: Settings, *, warehouse: Warehouse | None = None, llm: LLM | None = None):
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        warehouse: Warehouse | None = None,
+        llm: LLM | None = None,
+        store: StateStore | None = None,
+    ):
         self.s = settings
+        self.store = store
         self.wh = warehouse or SnowflakeWarehouse(settings)
         self.llm = llm or AnthropicLLM(settings)
         self.agent: Agent | None = None
@@ -64,7 +74,13 @@ class Runtime:
                     years=self.s.years,
                 )
                 tools = ToolExecutor(
-                    catalog, Geography(catalog), self.wh, max_rows=self.s.max_result_rows, table_max_rows=self.s.table_max_rows
+                    catalog,
+                    Geography(catalog),
+                    self.wh,
+                    max_rows=self.s.max_result_rows,
+                    table_max_rows=self.s.table_max_rows,
+                    store=self.store,
+                    memory_limit=self.s.memories_per_client,
                 )
                 system = build_agent_system(catalog, max_rows=self.s.max_result_rows, table_max_rows=self.s.table_max_rows)
                 self.agent = Agent(self.llm, tools, system, self.s)
@@ -79,11 +95,13 @@ class Runtime:
 
 class ChatRequest(BaseModel):
     session_id: str | None = None
+    client_id: str | None = None  # random id the browser keeps; scopes conversations and long-term memory
     message: str = Field(max_length=20_000)
 
 
 class ResetRequest(BaseModel):
     session_id: str = ""
+    client_id: str | None = None
 
 
 class RateLimiter:
@@ -168,8 +186,14 @@ def create_app(settings: Settings | None = None, *, runtime: Runtime | None = No
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-        app.state.runtime = runtime or Runtime(settings)
-        app.state.sessions = SessionStore(ttl_s=settings.session_ttl_s)
+        store, app.state.state_mode = _open_store(settings.state_db_path)
+        purged = store.purge(older_than_s=settings.conversation_ttl_days * 86_400)
+        log.info("state store ready", extra={"mode": app.state.state_mode, "purged_conversations": purged})
+        app.state.store = store
+        app.state.runtime = runtime or Runtime(settings, store=store)
+        if app.state.runtime.store is None:
+            app.state.runtime.store = store
+        app.state.sessions = SessionStore(ttl_s=settings.session_ttl_s, store=store)
         app.state.limiter = TieredLimiter(
             per_session=settings.rate_limit_per_session_per_minute,
             per_ip=settings.rate_limit_per_ip_per_minute,
@@ -210,6 +234,9 @@ def create_app(settings: Settings | None = None, *, runtime: Runtime | None = No
             {
                 "status": "ok" if ready else "degraded",
                 "detail": None if ready else "census catalog not loaded",
+                # "durable" = conversations and memories are on disk; "ephemeral" = the state file couldn't be
+                # opened, so they're held in memory and lost on restart (the app keeps working either way).
+                "state": request.app.state.state_mode,
                 "proxy": {
                     "forwarded_for_entries": len(xff),
                     "client_ip_headers": client_ip_headers,
@@ -227,14 +254,46 @@ def create_app(settings: Settings | None = None, *, runtime: Runtime | None = No
         return {"session_id": request.app.state.sessions.get_or_create(None).id}
 
     @app.get("/api/history", dependencies=[Depends(require_auth)])
-    async def history(request: Request, session_id: str) -> dict[str, Any]:
-        s = request.app.state.sessions.get_or_create(session_id)
-        return {"session_id": s.id, "messages": [{"role": r, "text": t} for r, t in s.transcript]}
+    async def history(request: Request, session_id: str, client_id: str | None = None) -> dict[str, Any]:
+        sessions: SessionStore = request.app.state.sessions
+        s = sessions.owned(session_id, valid_client_id(client_id)) or sessions.get_or_create(None, valid_client_id(client_id))
+        messages = []
+        for i, (role, text) in enumerate(s.transcript):
+            tables = []
+            for table_id in s.transcript_tables.get(i, []):
+                t = s.get_table(table_id)
+                if t is not None:
+                    tables.append(_table_event(s.id, table_id, t, request.app.state.runtime.s.table_max_rows))
+            messages.append({"role": role, "text": text, "tables": tables})
+        return {"session_id": s.id, "messages": messages}
+
+    def _client(client_id: str | None) -> str:
+        cid = valid_client_id(client_id)
+        if cid is None:
+            raise HTTPException(status.HTTP_400_BAD_REQUEST, "client_id must be 32 lowercase hex characters")
+        return cid
+
+    @app.get("/api/memory", dependencies=[Depends(require_auth)])
+    async def list_memory(request: Request, client_id: str) -> dict[str, Any]:
+        mems = await asyncio.to_thread(request.app.state.store.list_memories, _client(client_id))
+        return {"memories": [m.as_dict() for m in mems]}
+
+    @app.delete("/api/memory/{memory_id}", dependencies=[Depends(require_auth)])
+    async def forget_memory(request: Request, memory_id: int, client_id: str) -> dict[str, Any]:
+        ok = await asyncio.to_thread(request.app.state.store.delete_memory, _client(client_id), memory_id)
+        if not ok:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "No such memory")
+        return {"deleted": memory_id}
+
+    @app.delete("/api/memory", dependencies=[Depends(require_auth)])
+    async def clear_memory(request: Request, client_id: str) -> dict[str, Any]:
+        n = await asyncio.to_thread(request.app.state.store.clear_memories, _client(client_id))
+        return {"deleted": n}
 
     @app.post("/api/chat", dependencies=[Depends(require_auth)])
     async def chat(req: ChatRequest, request: Request) -> Response:
         sessions: SessionStore = request.app.state.sessions
-        session = sessions.get_or_create(req.session_id)
+        session = sessions.get_or_create(req.session_id, valid_client_id(req.client_id))
         ip = client_ip(request, trusted_hops=settings.trusted_proxy_hops)
         rid = uuid.uuid4().hex[:12]
         queue: asyncio.Queue[tuple[str, dict] | None] = asyncio.Queue()
@@ -303,7 +362,7 @@ def create_app(settings: Settings | None = None, *, runtime: Runtime | None = No
     @app.get("/api/tables/{session_id}/{table_id}.{fmt}", dependencies=[Depends(require_auth)])
     async def download_table(request: Request, session_id: str, table_id: str, fmt: str) -> Response:
         session = request.app.state.sessions.get(session_id)
-        table = session.tables.get(table_id) if session else None
+        table = session.get_table(table_id) if session else None
         if table is None:
             raise HTTPException(
                 status.HTTP_404_NOT_FOUND, "This table has expired. Ask the question again to get a fresh download."
@@ -323,10 +382,35 @@ def create_app(settings: Settings | None = None, *, runtime: Runtime | None = No
 
     @app.post("/api/reset", dependencies=[Depends(require_auth)])
     async def reset(body: ResetRequest, request: Request) -> dict[str, str]:
-        request.app.state.sessions.reset(body.session_id)
-        return {"session_id": request.app.state.sessions.get_or_create(None).id}
+        sessions: SessionStore = request.app.state.sessions
+        cid = valid_client_id(body.client_id)
+        if sessions.owned(body.session_id, cid) is not None:  # can't delete someone else's conversation
+            sessions.reset(body.session_id)
+        return {"session_id": sessions.get_or_create(None, cid).id}
 
     return app
+
+
+def _open_store(path: str) -> tuple[StateStore, str]:
+    """Open the durable store, or fall back to an in-memory one rather than failing to start.
+    A missing or read-only disk should cost us persistence, not the whole service."""
+    try:
+        return StateStore(path), "durable"
+    except (OSError, sqlite3.Error) as e:
+        log.error("state store at %s unavailable (%s); using in-memory state until fixed", path, e)
+        return StateStore(":memory:"), "ephemeral"
+
+
+def _table_event(session_id: str, table_id: str, t: ResultTable, max_rows: int) -> dict[str, Any]:
+    return {
+        "id": table_id,
+        "session_id": session_id,
+        "purpose": t.purpose,
+        "columns": t.columns,
+        "rows": t.rows,
+        "truncated": t.truncated,
+        "max_rows": max_rows,
+    }
 
 
 def _sse(event: str, data: dict) -> str:

@@ -8,6 +8,7 @@ which ends the turn because retrying won't help.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass, field
@@ -16,6 +17,7 @@ from typing import Any
 from .catalog import Catalog
 from .geography import Geography
 from .sql_guard import SqlRejected, validate
+from .store import MEMORY_KINDS, MEMORY_MAX_CHARS, MemoryRejected, StateStore
 from .warehouse import Warehouse, WarehouseError, WarehouseUnavailable
 
 log = logging.getLogger(__name__)
@@ -91,6 +93,29 @@ TOOL_DEFS: list[dict] = [
 ]
 
 
+TOOL_DEFS += [
+    _tool(
+        "remember",
+        "Save a lasting preference or interest the user has stated, so later conversations can use it. Examples: "
+        "'Prefers the 2019 release by default', 'Focuses on Texas counties', 'Wants percentages, not raw counts'. "
+        "Use only when the user states a lasting preference or asks you to remember something. Never save "
+        "instructions about how you behave, personal or contact details, or facts from a single question.",
+        {
+            "kind": {"type": "string", "enum": list(MEMORY_KINDS), "description": "preference, focus (places/topics), or note"},
+            "text": {"type": "string", "description": f"One short sentence, at most {MEMORY_MAX_CHARS} characters."},
+        },
+        ["kind", "text"],
+    ),
+    _tool(
+        "forget",
+        "Delete a saved memory by its id (ids are shown in the memory section of your instructions), when the user "
+        "asks you to forget it or says it no longer applies.",
+        {"memory_id": {"type": "integer", "description": "The id of the memory to delete."}},
+        ["memory_id"],
+    ),
+]
+
+
 @dataclass
 class ToolOutput:
     content: str
@@ -101,15 +126,25 @@ class ToolOutput:
 
 class ToolExecutor:
     def __init__(
-        self, catalog: Catalog, geography: Geography, warehouse: Warehouse, *, max_rows: int, table_max_rows: int = 10_000
+        self,
+        catalog: Catalog,
+        geography: Geography,
+        warehouse: Warehouse,
+        *,
+        max_rows: int,
+        table_max_rows: int = 10_000,
+        store: StateStore | None = None,
+        memory_limit: int = 20,
     ):
+        self.store = store
+        self.memory_limit = memory_limit
         self.catalog = catalog
         self.geo = geography
         self.wh = warehouse
         self.max_rows = max_rows  # what the model sees
         self.table_max_rows = max(table_max_rows, max_rows)  # what a user-facing table can hold
 
-    async def run(self, name: str, args: Any) -> ToolOutput:
+    async def run(self, name: str, args: Any, *, client_id: str | None = None) -> ToolOutput:
         if not isinstance(args, dict):
             return ToolOutput(json.dumps({"error": "Tool input must be a JSON object."}), is_error=True)
         try:
@@ -119,6 +154,8 @@ class ToolExecutor:
                 return self._describe_table(_str(args, "table_number"))
             if name == "resolve_geography":
                 return self._resolve_geography(_str(args, "place"))
+            if name in ("remember", "forget"):
+                return await asyncio.to_thread(self._memory, name, args, client_id)
             if name == "run_sql":
                 return await self._run_sql(_str(args, "sql"), str(args.get("purpose", "")), args.get("show_table") is True)
             return ToolOutput(json.dumps({"error": f"Unknown tool {name!r}."}), is_error=True)
@@ -126,6 +163,30 @@ class ToolExecutor:
             return ToolOutput(json.dumps({"error": str(e)}), is_error=True)
 
     # ------------------------------------------------------------------
+    def _memory(self, name: str, args: dict, client_id: str | None) -> ToolOutput:
+        if self.store is None or client_id is None:
+            return ToolOutput(
+                json.dumps({"error": "Memory isn't available in this session. Tell the user it can't be saved."}), is_error=True
+            )
+        if name == "remember":
+            try:
+                mem = self.store.add_memory(
+                    client_id, str(args.get("kind", "")), str(args.get("text", "")), limit=self.memory_limit
+                )
+            except MemoryRejected as e:
+                return ToolOutput(json.dumps({"error": f"Not saved: {e}."}), is_error=True)
+            return _memory_result({"saved": mem.as_dict()}, {"action": "saved", "memory": mem.as_dict()})
+        raw = args.get("memory_id")
+        if isinstance(raw, bool) or not isinstance(raw, int | str):
+            raise _BadArgs("'memory_id' must be an integer.")
+        try:
+            memory_id = int(raw)
+        except ValueError:
+            raise _BadArgs("'memory_id' must be an integer.") from None
+        if not self.store.delete_memory(client_id, memory_id):
+            return ToolOutput(json.dumps({"error": f"No memory with id {memory_id}."}), is_error=True)
+        return _memory_result({"forgotten": memory_id}, {"action": "forgot", "id": memory_id})
+
     def _search_fields(self, query: str, include_moe: bool) -> ToolOutput:
         hits = self.catalog.search_fields(query, limit=15, include_moe=include_moe)
         if not hits:
@@ -235,6 +296,14 @@ class ToolExecutor:
                 "full result as a table."
             )
         return ToolOutput(json.dumps(payload, default=str), meta=meta)
+
+
+class _MemoryUnavailable(Exception):
+    pass
+
+
+def _memory_result(payload: dict[str, Any], meta: dict[str, Any]) -> ToolOutput:
+    return ToolOutput(json.dumps(payload), meta={"memory": meta})
 
 
 def _model_view(rows: list[list[Any]], cap: int) -> tuple[list[list[Any]], str]:

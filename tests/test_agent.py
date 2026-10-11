@@ -367,9 +367,9 @@ class _StallAfterStreaming(ScriptedLLM):
         super().__init__(steps=steps)
         self.partial = partial
 
-    async def agent_turn(self, *, system, messages, tools, on_text):
+    async def agent_turn(self, *, system, messages, tools, on_text, memory=""):
         if self.steps:
-            return await super().agent_turn(system=system, messages=messages, tools=tools, on_text=on_text)
+            return await super().agent_turn(system=system, messages=messages, tools=tools, on_text=on_text, memory=memory)
         await on_text(self.partial)
         await asyncio.sleep(10)
         raise AssertionError("should have hit the deadline")

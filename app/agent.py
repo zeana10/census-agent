@@ -19,6 +19,7 @@ from typing import Any
 from . import guardrails
 from .config import Settings
 from .llm import LLM, LLMError, ToolCall, Turn
+from .prompts import build_memory_block
 from .sessions import ResultTable, Session
 from .tools import TOOL_DEFS, ToolExecutor, ToolOutput
 from .warehouse import WarehouseUnavailable
@@ -107,7 +108,8 @@ class Agent:
         queried_this_turn = False
         turn_results: list[str] = []  # successful tool results this turn, for the verifier
         streamed: list[str] = []  # text streamed in the current model step, kept if the deadline hits
-        tables_shown: list[str] = []  # one-line descriptions of tables shown to the user this turn
+        tables_shown: list[tuple[str, str]] = []  # (table id, one-line description) for tables shown this turn
+        memory_block = await self._memory_block(session)
         last_table: dict | None = None  # most recent successful query result, the fallback answer
 
         async def on_text(t: str) -> None:
@@ -129,7 +131,9 @@ class Agent:
                 stats.steps += 1
                 streamed.clear()
                 turn: Turn = await asyncio.wait_for(
-                    self.llm.agent_turn(system=self.system, messages=messages, tools=TOOL_DEFS, on_text=on_text),
+                    self.llm.agent_turn(
+                        system=self.system, messages=messages, tools=TOOL_DEFS, on_text=on_text, memory=memory_block
+                    ),
                     timeout=remaining,
                 )
                 stats.add_usage(turn.usage)
@@ -221,7 +225,9 @@ class Agent:
             if not final_text:
                 final_text = "I wasn't able to produce an answer for that. Could you rephrase or narrow the question?"
                 await emit("replace", {"text": final_text})
-            session.commit(messages, question, _with_table_notes(final_text, tables_shown))
+            session.commit(
+                messages, question, _with_table_notes(final_text, tables_shown), table_ids=[t[0] for t in tables_shown]
+            )
 
         except asyncio.CancelledError:
             # The user pressed Stop or closed the tab. Nothing was committed, so the
@@ -245,7 +251,12 @@ class Agent:
                 if messages[-1]["role"] == "assistant":
                     self._commit_plain(session, question, fallback[1])
                 else:
-                    session.commit([*messages, {"role": "assistant", "content": fallback[1]}], question, fallback[1])
+                    session.commit(
+                        [*messages, {"role": "assistant", "content": fallback[1]}],
+                        question,
+                        fallback[1],
+                        table_ids=[t[0] for t in tables_shown],
+                    )
         except LLMError as e:
             stats.outcome = "llm_error"
             msg = e.user_safe + (" Please try again." if e.retryable else "")
@@ -274,12 +285,16 @@ class Agent:
         return stats
 
     # ------------------------------------------------------------------------
-    async def _run_tools(self, turn: Turn, emit: Emit, stats: TurnStats, session: Session, tables: list[str]) -> list[ToolOutput]:
+    async def _run_tools(
+        self, turn: Turn, emit: Emit, stats: TurnStats, session: Session, tables: list[tuple[str, str]]
+    ) -> list[ToolOutput]:
         for c in turn.tool_calls:
             await emit("status", {"text": _status_for(c.name, c.input)})
 
         async def one(c: ToolCall) -> ToolOutput:
-            out = await self.tools.run(c.name, c.input)
+            out = await self.tools.run(c.name, c.input, client_id=session.client_id)
+            if out.meta.get("memory") and not out.is_error:
+                await emit("memory", out.meta["memory"])
             if c.name == "run_sql":
                 if out.is_error:
                     stats.queries_failed += 1
@@ -354,7 +369,13 @@ class Agent:
         claims = "; ".join(verdict.unsupported_claims[:5]) or verdict.reason
         return f"claims the query results don't support ({claims})"
 
-    async def _show_table(self, session: Session, meta: dict, table: dict, emit: Emit, tables: list[str]) -> None:
+    async def _memory_block(self, session: Session) -> str:
+        store = self.tools.store
+        if store is None or session.client_id is None:
+            return ""
+        return build_memory_block(await asyncio.to_thread(store.list_memories, session.client_id))
+
+    async def _show_table(self, session: Session, meta: dict, table: dict, emit: Emit, tables: list[tuple[str, str]]) -> None:
         """Store the full result for download and send it to the browser. The rows come straight from
         Snowflake, so a large table is never retyped (and possibly mistyped) by the model."""
         rt = ResultTable(
@@ -365,7 +386,7 @@ class Agent:
             truncated=table["truncated"],
         )
         table_id = session.add_table(rt, keep=self.s.tables_per_session)
-        tables.append(f"{rt.purpose or 'Query result'}: {len(rt.rows):,} rows")
+        tables.append((table_id, f"{rt.purpose or 'Query result'}: {len(rt.rows):,} rows"))
         await emit(
             "table",
             {
@@ -418,11 +439,12 @@ def _timeout_fallback(partial: str, table: dict | None, *, table_shown: bool = F
     return None
 
 
-def _with_table_notes(text: str, tables: list[str]) -> str:
-    """Transcript copy of an answer: notes which tables were shown (tables aren't re-sent on page reload)."""
+def _with_table_notes(text: str, tables: list[tuple[str, str]]) -> str:
+    """Transcript copy of an answer: notes which tables were shown, so the guardrail's view of the
+    conversation knows about them (the tables themselves are restored from the store on reload)."""
     if not tables:
         return text
-    return text + "\n\n" + "\n".join(f"_Table shown: {t} (re-ask to download it again)._" for t in tables)
+    return text + "\n\n" + "\n".join(f"_Table shown: {desc}._" for _, desc in tables)
 
 
 def _markdown_table(columns: list[str], rows: list[list[Any]], max_rows: int = 60) -> str:
@@ -452,6 +474,10 @@ def _status_for(name: str, args: Any) -> str:
         return f"Looking up “{str(a.get('place', ''))[:60]}”…"
     if name == "run_sql":
         return f"Querying: {str(a.get('purpose', 'running query'))[:80]}…"
+    if name == "remember":
+        return "Saving that to memory…"
+    if name == "forget":
+        return "Removing that from memory…"
     return "Working…"
 
 
