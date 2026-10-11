@@ -1,93 +1,235 @@
 # Decision log
 
-> ✍️ **Draft, generated from the build session. Edit it so every entry matches
-> what you actually decided and why.** Delete anything you can't defend in the
-> interview.
-
-The significant decisions made while building this, roughly in order. Each
-entry says what was chosen, what else was considered, and what triggered it.
-Several were changed later after testing against the real data; those changes
-are recorded too. All dates are 2026-10-10.
+These are the choices that shaped the project, roughly in the order I made
+them, with what I considered instead and what pushed me one way. A few of them
+were reversals: something I believed until the real data or a real deployment
+proved otherwise. Everything here happened on 2026-10-10.
 
 ---
 
-### D1. Tool-using agent with schema retrieval, not schema in the prompt
-- **Chose:** Claude with four tools (`search_fields`, `describe_table`, `resolve_geography`, `run_sql`). A one-line-per-table overview sits in the system prompt; field-level detail is fetched on demand.
-- **Alternatives:** put the full schema in the prompt (~8,000 columns, far too large); hard-code a curated subset of columns (the brief warns against limiting to a subset); a fixed text-to-SQL prompt (no way to explore the schema).
-- **Why:** it covers every column, keeps the prompt small and cacheable, and each step is visible and testable.
+### 1. Let the model look up the schema instead of pasting it into the prompt
 
-### D2. Anthropic API rather than Snowflake Cortex
-- **Chose:** Claude through the Anthropic API, with Snowflake used only for data.
-- **Alternatives:** Cortex Analyst, Cortex Agents, `AI_COMPLETE`, Cortex Search. The full comparison is in the README, "Why not Snowflake Cortex?".
-- **Why:** Cortex Analyst's semantic views are meant for curated subsets (Snowflake recommends about 50 columns), which conflicts with covering the whole dataset. A hand-built loop gives control over the deadline, the grounding checks and rolling back failed turns. The newest models and features arrive on the Anthropic API first.
-- **Cost, stated openly:** query results leave Snowflake. Fine for public census data; it would be a governance issue for a customer with sensitive data.
-- **Follow-up:** Cortex Search for field retrieval is the first planned improvement.
+The share has about 8,000 columns with names like `B19013e1`. There's no way
+to fit that in a prompt. Hand-picking the 50 "important" ones would go against
+the brief's tip not to limit yourself to a subset.
 
-### D3. Hand-written agent loop, not an SDK tool runner or a framework
-- **Chose:** a hand-written loop in `agent.py`.
-- **Alternatives:** the Anthropic SDK tool runner; LangChain or LangGraph.
-- **Why:** the brief grades behaviour on the edges: a hard 50 s deadline, a forced "wrap up" step, progress events, a step cap, and turns that are all-or-nothing (a failed turn never leaves an unanswered tool call in history). These are easier to guarantee and test in about 300 lines I fully control.
+So the prompt gets a one-line summary per census table. The model has four
+tools: search the field descriptions, list a table's fields, turn a place name
+into its code, and run SQL. It finds the exact column when it needs it.
 
-### D4. Three layers of safety for model-written SQL
-- **Chose:** a static allow-list check with sqlglot (single SELECT, census tables only, no system functions, row cap), a read-only Snowflake role that can only see the share, and a statement timeout plus a credit cap.
-- **Why:** the static check catches mistakes cheaply and gives the model an error to fix. The database permissions are the real guarantee if the check ever has a gap.
+*Considered:* the whole schema in the prompt (too big); a curated subset (goes
+against the brief); a fixed text-to-SQL prompt (no way to explore).
 
-### D5. Python, FastAPI and streaming responses (SSE)
-- **Chose:** Python, FastAPI, Server-Sent Events, and a single static HTML page.
-- **Alternatives:** Streamlit (simpler, but less control over streaming and auth; Streamlit-in-Snowflake would need reviewer Snowflake logins); WebSockets.
-- **Why:** async suits a workload that mostly waits on the model and database. SSE is the simplest way to stream progress and answers, and there's no front-end build step to break on deploy.
+### 2. Claude through the Anthropic API, not Snowflake Cortex
 
-### D6. Staff-level review pass, then fixes
-- **Trigger:** I asked for a critical review of the language and tool choices before going further.
-- **Changed:**
-  - All Snowflake queries ran one at a time behind a single connection; replaced with a connection pool.
-  - The rate limiter trusted a client-controlled `X-Forwarded-For` entry; fixed by counting trusted proxy hops.
-  - Startup blocked on Snowflake, which could fail health checks; the catalog now loads in the background.
-  - Added uv lockfile, ruff, mypy, CI, and JSON logs with request IDs.
+This is the decision I expect to be asked about most, so the README has a full
+comparison. The short version:
+- **Cortex Analyst** works from curated semantic views, and Snowflake
+  recommends keeping those to about 50 columns. That's the opposite of covering
+  the whole dataset.
+- **Cortex Agents** would have saved me writing the loop, but I wanted direct
+  control over the deadline, the grounding checks and how failed turns are
+  thrown away.
 
-### D7. Haiku for the input guardrail, Opus for the agent
-- **Chose:** `claude-haiku-5-5` (low effort) for classification; `claude-opus-5-5` (medium effort) for the agent.
-- **Why:** the guardrail runs on every message and *is* the fast-fail path, so speed matters most there. Rejections take about 2 s in the evals. Aggregation correctness is a reasoning problem, so the agent gets the strongest model.
-- **Related:** if Haiku refuses to classify, the message goes on to the agent rather than being blocked. A small classifier is more likely to wrongly flag legitimate race and income questions, and the agent has its own safety handling.
+The honest cost: query results leave Snowflake to go to Anthropic. That's fine
+for public census data, but it would be a real governance conversation for a
+customer with private data. Cortex Search is the first thing I'd bring in, for
+field search.
 
-### D8. Fixed field search after seeing the real metadata
-- **Trigger:** the first run against the real share returned *median earnings* for "median household income".
-- **Cause:** each field's description levels repeat the table title and universe, which drowned out the words that tell sibling fields apart. Synonym expansion ("income" to "earnings") also counted at full weight.
-- **Changed:** stripped the repeated levels from labels, down-weighted synonyms to 0.3, added plural folding, and updated the test fixtures to match the real metadata format.
+### 3. Write the agent loop myself
 
-### D9. Support both ACS releases (2019 and 2020)
-- **Trigger:** listing the share showed 2020 ACS tables alongside 2019. The first version loaded only 2019.
-- **Chose:** load both. Default to the latest release when no year is named, and always state which release was used.
-- **Prompt rules added:** consecutive 5-year releases overlap by four years, so differences aren't year-over-year change; dollars are in each release's own year's dollars; never join block groups across years.
-- **Deliberately not included:** the 2020 decennial redistricting tables (different metadata format; next data addition), and two small derived rent tables that duplicate ACS table B25070.
+*Considered:* the Anthropic SDK's tool runner, LangChain, LangGraph.
 
-### D10. Rate limits per session, per IP and overall
-- **Trigger:** working out how reviewers would reach the demo. Several reviewers behind one office IP would share a per-IP limit of 12 a minute.
-- **Chose:** 10 a minute per browser session (fairness between users), 60 per IP (stops session-ID rotation), 120 overall (cost ceiling). A request refused by one limit doesn't count against the others.
+What the brief cares about is behaviour at the edges:
+- a hard time limit per question;
+- a forced "answer with what you have" when time runs low;
+- progress updates while it works;
+- never leaving the conversation broken when something fails halfway.
 
-### D11. Basic auth rather than a login page
-- **Why:** the brief allows credentials, and the browser's built-in prompt can't break. The brief warns specifically about "authentication loops".
+All of that is easier to guarantee, and to test, in about 300 lines I fully
+understand than inside a framework.
 
-### D12. Targeted UI fixes, not a redesign
-- **Chose:** a Stop button, Retry with a request ID on failures, a data-coverage note, and readable SQL without the internal row cap.
-- **Rejected:** a redesign. UI isn't one of the graded dimensions, and the existing UI already streams answers, shows progress and shows the SQL.
+### 4. Three layers of protection on model-written SQL
 
-### D13. Narrower follow-up rules
-- **Trigger:** reading real answers by hand. After a Florida 2019-vs-2020 question, "Population of Washington?" also got an unrequested year comparison.
-- **Changed:** short follow-ups inherit whatever they leave out; a complete question starts fresh. Added the eval case `no_stale_carry_forward`.
+1. **A parser-based check** before anything runs: a single SELECT, census
+   tables only, no system functions, and a row cap.
+2. **A Snowflake role** that can only read the census share.
+3. **A statement timeout and a credit cap** on the warehouse.
 
-### D14. LLM grounding verifier on the output side
-- **Trigger:** the brief's "ensure the agent stays within its grounded knowledge base". The only output check was a heuristic for large numbers.
-- **Chose:** Haiku checks every data claim against that turn's tool results, allowing arithmetic derivations. One retry, then a visible caveat. If the check itself fails, the answer is shown unverified and logged.
-- **Validated:**
-  - It caught three planted errors: a wrong percentage, a wrong release label, an outside figure.
-  - It passed correct derived and rounded figures.
-  - The full evaluation passed 25/25 with it on.
-- **Found by the eval:** one false alarm. The verifier only received SQL results, so a true count from the place lookup ("matched 32 places") looked unsupported. Fixed by passing every tool result, plus a regression test.
-- **Known limit:** if the agent queries the wrong field, the answer matches the wrong results and passes. The evals with ground-truth SQL are the guard against that.
+The first layer is about catching mistakes early and handing the model an error
+it can fix. The second and third are the real guarantee if the first one ever
+has a gap.
 
-### D15. Not done, on purpose (for now)
-- **Durable conversation storage (Redis or Postgres).** In-memory is fine for a single-instance demo; a restart loses conversations.
-- **Significance testing for comparisons between releases.** Needs aggregated margins of error.
-- **LLM-graded answer quality in the evals.** The current checks are numbers, keywords and outcomes.
-- **Cortex Search** (see D2).
+### 5. Python, FastAPI and a plain HTML page with streaming
+
+Most of the time is spent waiting on the model and the database, which suits
+async Python. Server-sent events are the simplest way to stream progress lines
+and the answer. A single static HTML page means no front-end build that could
+break on deploy.
+
+*Considered:* Streamlit. It's quicker to start, but gives less control over
+streaming and login, and Streamlit-in-Snowflake would have needed every
+reviewer to have a Snowflake login.
+
+### 6. Asking for a staff-level review before going further
+
+Once the first version worked offline, I asked for a critical review of the
+stack, as if from a staff engineer. Things it caught and I fixed:
+- **Concurrency:** all Snowflake queries went through one locked connection,
+  so two users would wait on each other. Now it's a connection pool.
+- **Rate limiting:** the limiter read the client IP from a header the client
+  controls. Now it only trusts entries added by known proxies.
+- **Tooling:** no lockfile, linting, type checking, CI or structured logs. All
+  added.
+
+Writing the CI check that boots the container without credentials then exposed
+another one: startup waited on Snowflake, so a slow or failed connection could
+stop the server answering health checks at all. The catalog now loads in the
+background.
+
+### 7. A small fast model for gatekeeping, the strongest one for the agent
+
+The input classifier first ran on the same big model as the agent. I moved it
+(and later the output verifier) to Haiku. It runs on every single message and
+*is* the fast-fail path, so speed is what matters there; rejections now take
+about 2 seconds. The agent stays on Opus because getting aggregations right is
+genuinely a reasoning problem.
+
+If Haiku refuses to classify something, the message goes to the agent rather
+than being blocked. A small classifier is more likely to wrongly flag a
+legitimate question about race and income, and the agent has its own safety
+handling.
+
+### 8. Fixing search once I saw the real metadata
+
+The first real query for "median household income" came back with median
+*earnings*. Each field's description repeats its table title and population
+group, so every field in a table looked the same to keyword search. And my
+synonym list counted "income" → "earnings" as strongly as the real words.
+
+The fix:
+- strip the repeated parts from labels;
+- give synonyms much less weight;
+- treat plurals as their singular, so "veterans" finds "veteran".
+
+The bigger lesson was that my test fixtures didn't look like the real
+metadata, which is why no test caught this. I rebuilt them to match, quirks
+included.
+
+### 9. Supporting both 2019 and 2020
+
+Listing the real tables showed the share has two ACS releases, and I'd only
+loaded 2019. Ignoring 2020 would have made the agent refuse "how did Texas
+change?" when the data was sitting right there.
+
+Now both are loaded:
+- When no year is named, it uses 2020 and says so.
+- Comparisons always come with two caveats: the two releases share four of
+  their five survey years, so the difference isn't a clean one-year change, and
+  each release reports dollars in its own year's dollars.
+- It never matches block groups across years, because boundaries can change.
+
+*Left out on purpose:* the 2020 Census redistricting tables, which use a
+different metadata format and need their own loader, and two small derived rent
+tables that duplicate an existing ACS table.
+
+### 10. Three rate limits instead of one
+
+When I thought through how reviewers would actually use the demo, I realised
+several of them might sit behind one office IP, sharing a single "12 per
+minute" allowance. Now there are three limits:
+- **10 per browser session:** fairness between people.
+- **60 per IP:** stops someone dodging the first limit by faking new sessions.
+- **120 overall:** a cost ceiling.
+
+A request turned away by one limit doesn't count against the others.
+
+### 11. The browser's built-in login instead of a login page
+
+The brief allows a shared credential and warns about "authentication loops". The
+browser's own username and password prompt looks plain, but it can't loop or
+break.
+
+### 12. A few UI fixes, not a redesign
+
+UI isn't one of the things being graded, and the page already streamed answers
+and showed its SQL. I only added what a reviewer would actually hit:
+- a Stop button;
+- a Retry button with a reference ID when something fails;
+- a note on what data is covered;
+- readable SQL in the "How I got this" panel.
+
+### 13. Tightening how follow-up questions work
+
+Every eval case passed, but reading the answers by hand turned up a problem.
+After a Florida "2019 vs 2020" question, "Population of Washington?" got an
+unrequested year comparison. My prompt said to carry context forward, and the
+model did it for *every* question.
+
+The new rule: short follow-ups like "and Ohio?" or "in 2019?" inherit what they
+leave out, and a complete question starts fresh. I added an eval case so it
+can't quietly come back.
+
+### 14. An output check for grounding
+
+The input side was well covered, but on the output side I only had a heuristic
+for large numbers stated with no query behind them. I added a verifier: Haiku
+reads the answer and checks every figure against that turn's tool results,
+allowing for arithmetic such as percentages and sums. If something isn't
+supported, the agent gets one retry, then the answer goes out with a visible
+caveat.
+
+How it was tested:
+- **On planted errors** (a wrong percentage, a wrong release label, an outside
+  figure): it caught all three.
+- **On correct derived numbers** that it shouldn't flag: it left them alone.
+- **In the next full eval run:** one false alarm. I'd only given it the SQL
+  results, so a true fact from the place lookup ("the name matched 32 places")
+  looked invented. I fixed it by giving it all the evidence, not by making it
+  more lenient.
+
+What it can't do: if the agent queries the *wrong field*, the answer matches
+the wrong results and passes. The evals' independent ground-truth SQL is the
+guard there.
+
+### 15. Moving the project out of iCloud
+
+My project lived in Documents, which syncs to iCloud, on a nearly full disk.
+macOS had moved most of the project files to the cloud, so tests went from 7
+seconds to several minutes. Then iCloud was switched off and the local copy came
+back incomplete.
+
+Everything was already on GitHub, so I cloned it into a normal folder
+(`~/code`) and only had to restore my local secrets. It reinforced pushing
+early and keeping code out of synced folders.
+
+### 16. Deploying on Render, and measuring rather than assuming
+
+I chose Render because the whole thing ships as one Docker container with a
+blueprint file, and the paid Starter instance doesn't go to sleep while
+reviewers are looking.
+
+Two decisions came out of the deployment:
+- **Trusted proxy hops = 2.** My rate limiter assumed one proxy in front of
+  the app. Render's docs didn't say, so I added header counts (no IP addresses)
+  to `/healthz` and measured it. There are two hops, Cloudflare and then
+  Render's load balancer. Before the fix, the per-IP limit was counting
+  Cloudflare's data centres, not visitors.
+- **Check config on the running service.** Updating `render.yaml` and pushing
+  redeployed the code but didn't apply the new variable. `/healthz` reports
+  the live value, which is how I caught it.
+
+I deployed late in the day. Next time I'd deploy a bare skeleton first, since
+both of these were cheap to fix and only showed up on the real platform.
+
+### 17. Things I chose not to do (yet)
+
+- **Durable conversation storage.** Memory is fine for a one-instance demo;
+  Redis would be the next step.
+- **Significance tests for year comparisons.** These need properly combined
+  margins of error first.
+- **LLM-graded answer quality in the evals.** That's the gap the follow-up bug
+  slipped through.
+- **Running the live evals in CI.** Each run costs about 75¢ and needs real
+  credentials, so for now I run them by hand, and the results of the latest run
+  are committed (`evals/latest_run.json`).

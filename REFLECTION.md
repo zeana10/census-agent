@@ -1,146 +1,234 @@
 # Reflection
 
-> **DRAFT. Rewrite in your own words before submitting.** Everything marked
-> ✍️ needs your real experience: what you actually did, what surprised you,
-> real eval numbers. Reviewers will ask about this document in the follow-up.
+## How I built it
 
-## Development process
+I used Claude Code for nearly all of the code. My job was deciding what to
+build, pushing back on it, and checking that what came out was actually right.
+Most of what I'm proud of here came from that checking, not from the first
+draft.
 
-✍️ *Describe your actual timeline. Suggested skeleton:*
+The rough order things happened in:
 
-1. **Read the brief and the data first (~1 h).** Before writing the agent I
-   looked at the share's metadata tables. The deciding fact was ~7,500 opaque
-   columns keyed at block-group level, which ruled out "put the schema in the
-   prompt" and made aggregation correctness (medians, MOEs) the main risk.
-2. **Built the deterministic parts first:** catalog discovery, field search,
-   geography resolution, SQL validator. These are where silent wrong answers
-   come from, and they can be fully unit-tested.
-3. **Agent loop and guardrails**, tested against a scripted model and DuckDB
-   before spending any API tokens.
-4. **Deployed early** ✍️ *(when?)* to catch environment issues (key-pair auth
-   on a PaaS, SSE buffering behind the proxy).
-5. **Ran the live eval set, then iterated on prompts** ✍️ *(what changed, and
-   what the before/after pass rate was)*.
+**1. Design and an offline build.** I read the brief and settled on the
+architecture before touching the data: a tool-using agent that looks up the
+schema as it needs it, rather than a prompt stuffed with column names. I didn't
+have Snowflake access yet, so the first version was built and tested entirely
+offline. A small DuckDB database with the same table and column names stood in
+for Snowflake, and a scripted fake model stood in for Claude. That let me test
+the hard parts (SQL validation, the agent loop's error handling, deadlines)
+before spending anything.
 
-**How I used AI tools.** ✍️ *Be specific: which parts Claude Code wrote, what
-you reviewed or rewrote, and where it got something wrong. Examples from this
-build:*
-- *The first SQL validator capped results at exactly `max_rows`, so truncation could never be detected. A test caught it.*
-- *A staff-level review pass found that all Snowflake queries were serialized behind one lock (fixed with a connection pool), that the rate limiter trusted a client-controlled `X-Forwarded-For` entry (fixed by counting trusted proxy hops), and that startup blocked on Snowflake (moved to a background load).*
-- *Turning on mypy found several places where optional values were used as if always present.*
-- *The first live run failed on every turn: streamed messages have no `_request_id`, which a log line read. The error handling turned it into a polite apology rather than a crash. Fixed, and a wrapper test now covers it.*
-- *Reading real answers (not just pass/fail) found the agent repeating an earlier year comparison in an unrelated question. Fixed in the prompt, plus a new eval case.*
-- *The new output verifier's first eval run produced one false alarm. It had been given only SQL results, so a true count from the place lookup looked unsupported. Fixed, plus a regression test.*
+**2. A staff-level review of my own choices.** Before going further I asked
+for a critical review of the stack, as if a staff engineer were reading it. It
+found real problems:
+- every Snowflake query ran one at a time behind a single lock;
+- the rate limiter could be bypassed with a fake `X-Forwarded-For` header;
+- there was no lockfile, linting, type checking or CI.
 
-## Key architectural decisions
+I fixed all of those, and wrote up why I'm not using Snowflake Cortex (in the
+README) instead of leaving it as an unexplained gap.
 
-See the README "Key decisions" section for the full list. The ones I'd defend
-most strongly:
+**3. First contact with the real data.** 
+Setting up the Snowflake trial took a few attempts:
+- the share's database name was slightly different from what I'd assumed;
+- my first run of the setup script only executed one statement.
 
-- **Schema access through retrieval tools, not prompt stuffing.** A compact
-  table-level overview stays in the cached system prompt; field-level detail is
-  fetched on demand. This scales to the full dataset with no hard-coded columns.
-- **Deterministic code for anything that has a right answer.** FIPS codes, SQL
-  safety and row limits are enforced by code. The model is only trusted for
-  language and analysis.
-- **Three SQL safety layers.** The static allow-list catches mistakes early and
-  cheaply. The read-only role and timeouts are what actually guarantee safety
-  if the validator has a gap.
-- **Fail clearly, and keep state valid.** A turn either commits completely or
-  is replaced with an explanation. A database outage or timeout never corrupts
-  the conversation.
+Once the app could connect, three things came up:
+- **The data has 2020 too.** The share has both the 2019 and 2020 ACS
+  releases, and my code only loaded 2019. That contradicted the brief's own tip
+  about not limiting yourself to a subset, so I added both, with rules for
+  comparing them honestly.
+- **Search returned the wrong field.** It answered "median household income"
+  with median *earnings*. The metadata repeats each table's title inside every
+  field label, which drowned out the words that tell fields apart.
+- **My test data didn't look like the real thing,** which is why the tests
+  hadn't caught the search problem. I rebuilt the fixtures to copy the real
+  metadata layout, quirks included (one column in the share is literally named
+  `FIELD_LEVELl_9`).
 
-## What I'd improve with more time
+**4. Live runs and the eval set.** The very first live question failed. A log
+line read an attribute that streamed responses don't have. The error handling
+did its job (the user got an apology), but it showed I had no tests
+on the real Anthropic wrapper, so I added some. After that the 24-case eval set
+passed on its first run.
 
-1. **The share's 2020 decennial redistricting tables.** These are exact 2020
-   Census counts (race, Hispanic origin, voting age, housing occupancy) rather
-   than survey estimates. They need a second catalog loader for their different
-   metadata format, and prompt rules for when to prefer a count over an estimate.
+**5. Reading the answers, not just the scores.** Passing evals weren't the end
+of it. When I read the answers myself, I found a problem none of the checks
+flagged: after a Florida "2019 vs 2020" question, asking "Population of
+Washington?" got an unrequested year comparison tacked on. The prompt said to
+carry context forward, and the model did it for every question, not just
+follow-ups like "and Ohio?". I narrowed that rule and added an eval case for it.
 
-2. **Semantic field retrieval with Cortex Search.** BM25 plus a synonym list misses paraphrases ("folks without health insurance" vs "No health insurance coverage"). I'd also evaluate Cortex Analyst for the most common measures. The README section "Why not Snowflake Cortex?" covers the trade-offs and the migration path.
-3. **Durable, shared session state** (Redis or Postgres). Today a restart loses
-   conversations and the app can't scale past one instance.
-4. **Pre-aggregated county and state tables** (a materialized view or dbt).
-   Most questions are state- or county-level; summing 220k block groups each
-   time costs latency and credits, and makes medians impossible. ACS publishes
-   county and state tables directly, including true medians.
-5. **Margins of error.** Report a proper aggregated MOE (root-sum-of-squares
-   approximation) instead of only a caveat.
-6. **Evaluation:** a larger, regularly refreshed eval set, an LLM-as-judge pass
-   for answer quality (clarity, correct caveats), and a CI job that runs the
-   live evals on prompt changes with a cost cap.
-7. **Observability:** structured traces per turn (OpenTelemetry), with a
-   dashboard for latency percentiles, step counts, guardrail decisions,
-   grounding retries and token cost.
-8. **Auth:** real user accounts (SSO) and per-user quotas instead of a shared
-   Basic-auth credential and per-IP rate limiting.
+**6. A real output check.** The brief asks for guardrails that keep the agent
+"grounded". The input side was solid, but on the output side I only had a
+heuristic for big numbers. So I added a verifier: a small model checks every
+figure in an answer against the tool results from that turn. I tested it both
+ways:
+- it caught a wrong percentage, a wrong release label and an outside figure I
+  planted;
+- it left correct derived numbers alone.
 
-## Edge cases and failure modes not fully addressed
+Even so, the next full eval run turned up a false alarm. It had only been given
+SQL results, so a true count from the place lookup ("matched 32 places") looked
+made up. I fixed it by giving it every tool result, not by making it less
+strict.
 
-- **Comparisons between releases.** 2019 and 2020 5-year estimates share
-  2016–2019, so their difference mostly isn't real change, and it's often
-  within the margin of error. The agent is told to say so every time, but it
-  doesn't run a significance test, which would need the aggregated MOEs (see
-  "Margins of error" above). The 2020 release was also affected by the
-  pandemic's disruption to data collection.
-- **Boundary changes between releases.** Counties are unioned by GEOID; one
-  Alaska county exists only in 2020. Block groups can be redrawn, so the agent
-  aggregates each year separately and never joins block groups across years.
+**7. Shipping, and a detour.** I'd put the project in my Documents folder,
+which syncs to iCloud. My disk was nearly full, so macOS quietly moved most of
+the project files to the cloud. Tests that took 7 seconds suddenly took minutes.
+Then iCloud got switched off and the local copy came back incomplete. Because
+everything was already committed and pushed to GitHub, I cloned it fresh into a
+normal folder and only had to recover my local secrets. Lesson learned: commit
+and push early, and keep code out of synced folders.
 
-- **Medians and other non-additive statistics** above block-group level. The
-  agent explains the limitation and labels approximations, but it can't give
-  the true county median.
-- **Cities, ZIP codes, metro areas.** There's no place-level geography; the
-  agent offers the containing county, which is only approximate for cities that
-  span several counties.
-- **What the grounding verifier can't catch.** It checks that the answer
-  faithfully reports the query results, including arithmetic and release labels.
-  In spot checks it caught a wrong percentage, a mislabelled release and an
-  outside "national rate", and passed correct derived figures. But if the agent
-  queries the *wrong field* (for example the wrong universe for a denominator),
-  the answer will be consistent with wrong results and pass. That's now the main
-  remaining class of error. The live evals with ground-truth SQL are the guard
-  against it, and a field-selection review step would be the next layer.
-- **The verifier fails open and adds latency.** If it errors or times out, the
-  answer is shown unverified (logged as `verifier=error`). It adds about 2–4 s
-  to answers containing figures, and up to ~7 s on long ones.
-- **The guardrail classifier fails open.** If it errors or times out, the agent
-  still answers. Its system prompt and read-only tools keep it in scope, but a
-  cleverly phrased off-topic request is more likely to get through then.
-- **Prompt injection through data.** Field labels come from the share's
-  metadata, so they are trusted. Free-text values in query results could, in
-  principle, carry instructions; this dataset has essentially none.
-- **Long conversations** hit a turn limit (20) instead of being compacted.
-  History is append-only so the model's thinking blocks stay valid; server-side
-  compaction would be the next step.
-- **Rate limiting and sessions are per process,** so they reset on deploy.
-- **Cost controls** rely on the Snowflake resource monitor and Anthropic
-  workspace limits. There is no per-user token budget.
+**8. Deployment, late.** I deployed to Render at the end, and I'd do that
+differently next time. CI had already built the Docker image and booted it with
+no credentials, and writing that check is how I found that startup blocked on
+Snowflake (now it loads in the background). But the real deployment still taught
+me two things CI couldn't:
+- **The proxy chain.** Render routes traffic through Cloudflare *and* its own
+  load balancer, so my rate limiter was reading Cloudflare's IP as the
+  visitor's. The docs didn't say how many hops there were, so I made `/healthz`
+  report the header shape and measured it: two hops.
+- **Config doesn't follow a push.** Changing `render.yaml` and pushing didn't
+  update the running service's environment variables. I only noticed because
+  `/healthz` reports the live value.
 
-## Testing approach
+### Mistakes I'd call out
 
-**Strategy:** test deterministic components exhaustively offline, test the
-agent loop's *control flow* offline with a scripted model, and test *answer
-quality* live with a small set of evals whose numeric answers are checked
-against independent ground-truth SQL.
+Most of these were bugs in code Claude wrote that I didn't catch on the first
+read. Tests, live runs or reading output found them:
+- The SQL check capped results at exactly the row limit, so the app could never
+  tell when a result had been cut off. A test caught it.
+- The "Rank" column header wrapped as "Ran / k". Small, but a reviewer would
+  notice.
+- Turning on mypy found several places where a value could be missing but the
+  code assumed it wasn't.
+- The streaming log bug, the stale carry-forward and the verifier false alarm
+  above.
 
-- **118 offline tests (~7 s):**
-  - The SQL validator against write, DDL, multi-statement, cross-database, table-function and system-function attempts.
-  - Catalog discovery and search, and geography resolution, including ambiguity.
-  - Tool error mapping.
-  - The agent loop: retry after SQL errors, an outage mid-turn leaving valid history, the deadline, the step limit, the grounding retry, refusals.
-  - The HTTP layer: auth, SSE framing, degraded mode, rate limiting, request-id propagation into the logs.
-  - The connection pool's concurrency, and spoof-resistant client-IP parsing.
-- **Trade-off:** the offline suite runs on DuckDB, not Snowflake. Dialect gaps
-  are papered over with sqlglot transpilation, so Snowflake-specific SQL
-  failures only surface in the live evals.
-- **Live evals:** ✍️ *report actual results, e.g. "18/20 on the first run.
-  Failures were X and Y; I fixed X by …"*. Also report p50/p95 latency and cost
-  per question.
+The pattern I took away: generated code was usually right on the main path, and
+the problems were at the edges, in places that only show up with real data, a
+real deployment, or someone actually reading the output.
+
+## Key decisions
+
+`DECISIONS.md` has the full list with alternatives. The ones I'd defend
+hardest:
+
+- **The model looks the schema up; I don't paste it in.** There are about
+  8,000 columns with codes like `B19013e1`. The prompt gets a one-line summary
+  per table, and the model searches for specific fields when it needs them.
+  This covers the whole dataset without hard-coding anything.
+- **Code handles anything with a right answer.** Turning "Cook County" into
+  its FIPS code, checking SQL is safe, capping rows: these are deterministic
+  code, not left to the model.
+- **Three layers of SQL safety.** A parser-based allow-list catches mistakes
+  cheaply and gives the model an error it can fix. The real guarantee is that
+  the Snowflake role can only read the census share, plus a statement timeout
+  and a credit cap.
+- **A turn either completes or never happened.** If the database goes down or
+  the deadline hits mid-turn, that turn is thrown away and replaced with a plain
+  explanation. The stored conversation never ends up in a broken state.
+- **Haiku for the gatekeeping, Opus for the thinking.** The input classifier
+  and the output verifier run on every message, so they use the fast model.
+  Getting aggregations right is a reasoning problem, so the agent gets the
+  strongest one.
+- **Census correctness rules live in the prompt and the evals.** You can't add
+  up block-group medians into a county median. Consecutive 5-year releases
+  overlap by four years. Dollar figures are in each release's own year's
+  dollars. These are the mistakes that would look completely plausible in an
+  answer, so they're spelled out and tested.
+
+## What I'd do with more time
+
+1. **Deploy a skeleton in the first hour.** Both of the issues deployment
+   found were cheap to fix, but I found them at the end of the day.
+2. **Better field search.** Keyword search plus a synonym list still misses
+   paraphrases ("folks without health insurance"). Snowflake's Cortex Search is
+   the obvious next step and would slot in behind the existing search function.
+3. **The 2020 Census redistricting tables.** These are exact counts rather
+   than survey estimates. They use a different metadata format, so they need
+   their own loader and rules for when a count beats an estimate.
+4. **Pre-aggregated state and county tables.** Most questions are about
+   states or counties, and summing 220,000 block groups every time is slow and
+   rules out true medians. The Census Bureau publishes county-level tables
+   directly.
+5. **Margins of error.** Report a proper combined margin of error instead of
+   just a caveat. That would also let the agent say whether a 2019-vs-2020
+   difference is meaningful.
+6. **Evals that judge quality, not just keywords.** My checks are numbers,
+   keywords and outcomes. They passed while the stale carry-forward was
+   happening. An LLM-graded pass would have caught it.
+7. **Durable conversations.** They live in memory, so a restart loses them and
+   I can only run one instance. Redis would fix both.
+8. **Proper accounts** instead of one shared demo login, with per-user limits.
+
+## Edge cases I know about but didn't fully solve
+
+- **The verifier can't catch the wrong field.** It checks that the answer
+  matches the query results. If the agent queries the wrong field, for example
+  the wrong population as a denominator, the answer will faithfully report wrong
+  numbers and pass. That's the main remaining risk. The evals with independent
+  ground-truth SQL are what guard against it.
+- **Medians above block-group level.** The agent explains why it can't give a
+  true county median and offers a clearly labelled estimate. For King County it
+  came within 0.2% of the published figure, but it's still an estimate.
+- **Cities and ZIP codes** aren't in the data. The agent offers the county
+  instead, which is only approximate for cities that span several counties.
+- **Comparing 2019 and 2020.** The agent always gives the overlap caveat, but
+  it doesn't test whether a difference is statistically significant. Boundaries
+  also change between releases, so it never matches block groups across years.
+- **Both guardrails fail open.** If the classifier or the verifier errors or
+  times out, the answer still goes out (unverified, and logged). I chose
+  availability over strictness for a demo; a customer deployment might choose
+  differently.
+- **Long conversations** stop at 20 turns rather than being summarised.
+- **Rate limits and sessions reset on every deploy,** because they're in
+  memory.
+- **Costs** are capped by Snowflake's resource monitor and an Anthropic spend
+  limit. There's no per-user budget.
+
+## Testing
+
+I split testing by what each kind of test is good at:
+- **Deterministic parts, tested thoroughly offline.**
+- **The agent loop's control flow, tested offline** with a scripted model.
+- **Answer quality, tested live** against real data.
+
+**Offline (118 tests, about 7 seconds, no credentials).** These cover:
+- the SQL validator against injection and escape attempts;
+- schema discovery, field search and place lookup, including ambiguous names;
+- the agent loop under failure: SQL errors, the database dropping mid-turn,
+  deadlines, step limits, the verifier's retry, refusals;
+- the web layer: login, streaming, degraded mode, the three rate limits;
+- the connection pool.
+
+CI runs all of it on every push, then builds the Docker image and boots it with
+no credentials.
+
+The trade-off is that the offline tests run on DuckDB, not Snowflake.
+Snowflake-specific SQL problems only show up live.
+
+**Live (25 cases, about 8 minutes, about 75¢).** These are lookups, ratios,
+rankings, follow-ups, year comparisons, ambiguous and unanswerable questions,
+and adversarial ones. For the cases with a specific number, the runner works
+out the right answer with its own hand-written SQL, independent of the agent,
+and checks the answer matches.
+- **Results:** 24/24 on the first run; 25/25 on the latest, with the verifier
+  switched on.
+- **Speed:** median turn 12 seconds, slowest 23. Guardrail rejections about
+  2 seconds.
+- **Cost:** about 3 cents per answered question, with most of the prompt
+  served from cache.
+
+The evals passing isn't the whole story, though. They passed while the stale
+carry-forward problem was happening, and I only found it by reading answers.
+That's the clearest gap in my testing.
 
 **What I'd add:**
-- Property-based tests for the SQL validator (generated hostile SQL).
-- A contract test that runs a sample of model-written queries against real Snowflake in CI.
-- Load tests for concurrent SSE streams.
-- Regression evals built from logged production failures.
-- Tracking eval scores over time, per prompt or model change.
+- an LLM-graded quality check on the eval answers;
+- generated hostile SQL to fuzz the validator;
+- a CI job that runs a sample of model-written SQL against real Snowflake;
+- load tests for many streaming users at once;
+- tracking eval scores over time so prompt changes can't silently regress.
