@@ -326,7 +326,33 @@ The decisions behind it:
   Claude API has a general memory tool, but structured, validated notes were
   easier to secure and to show to users.
 
-### 20. Things I chose not to do (yet)
+### 20. Security hardening before review
+
+A security pass found four gaps. I fixed them:
+- **Third-party scripts.** The page loaded its Markdown and sanitising
+  libraries from a CDN with no integrity check. A compromised CDN could have
+  run code on the page and read the browser ID that guards conversations and
+  memories. Both libraries are now served by the app, verified against the npm
+  registry's integrity hashes. The page's own CSS and JavaScript moved into
+  files, so a strict Content-Security-Policy (`'self'` only, no inline code, no
+  framing) could go on every response. I checked it in a real browser: no
+  policy violations, and streaming, Markdown, tables and the Memory panel all
+  work.
+- **Password guessing.** Rate limits covered chat, not logins. Now 10 wrong
+  passwords from an IP lock it out for 10 minutes, checked before the
+  password, so a locked-out guesser learns nothing even if they hit the right
+  one.
+- **`/healthz` said too much.** It's public, so it now returns only
+  `ok` or `degraded`. The operational detail moved behind the login, to
+  `/api/status`.
+- **Data handling wasn't written down.** The README now says what goes to
+  Anthropic, what's stored where, for how long, and what's weak.
+
+*Not changed:* the shared demo password. The brief allows it, and real
+accounts are the proper fix. Instead it's documented as the main weakness, to
+be rotated after the review.
+
+### 21. Things I chose not to do (yet)
 
 - **Multiple instances.** State is in SQLite on one disk; Postgres would be
   the step for scaling out.

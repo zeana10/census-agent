@@ -44,7 +44,7 @@ Expand **How I got this** under any answer to see the exact SQL that produced it
 | Comprehensive mapping (no subset) | Catalog built from the share's own metadata: all 8,084 fields, 353 tables, both releases, no hard-coded columns | `catalog.py` | `scripts/inspect_schema.py`; catalog tests |
 | Context awareness of the schema | Table-level overview in the (cached) system prompt; field-level detail on demand via `search_fields` / `describe_table` | `catalog.py`, `tools.py` | Agent picks e.g. B15003e22–e25 or B19001 brackets unaided in evals |
 | Deployment "truth" | CI builds the image and boots it with no credentials (must come up degraded, not crash); background catalog load so health checks pass immediately | `.github/workflows/ci.yml` | CI run |
-| Meaningful tests | 161 offline tests (DuckDB stand-in for Snowflake, scripted model) + 27 live evals with independent ground truth | `tests/`, `evals/` | See *Tests* below |
+| Meaningful tests | 168 offline tests (DuckDB stand-in for Snowflake, scripted model) + 27 live evals with independent ground truth | `tests/`, `evals/` | See *Tests* below |
 
 ## Architecture
 
@@ -207,7 +207,7 @@ job inside the account. I considered each piece:
 
 **Why the trade-off favours the current design for this brief.**
 1. **Comprehensive coverage.** The schema is reached through retrieval tools over the share's own metadata, so every column can be answered without curating a subset first.
-2. **Control and testability.** Every step — guardrail, retrieval, SQL validation, deadline, grounding check — is ordinary Python. That's why 161 offline tests can pin down its behaviour.
+2. **Control and testability.** Every step — guardrail, retrieval, SQL validation, deadline, grounding check — is ordinary Python. That's why 168 offline tests can pin down its behaviour.
 3. **Model quality.** Correct aggregation (never summing medians, matching numerator and denominator universes) is mostly a reasoning problem, so I wanted the strongest current model.
 
 **What it costs.** I maintain an orchestration loop and session store that
@@ -255,11 +255,38 @@ app/
   logging_setup.py  JSON logs with per-request correlation ids
   prompts.py      all prompt text
   export.py       Excel/CSV downloads for result tables
-  static/index.html
-tests/            161 offline tests (DuckDB stands in for Snowflake, scripted LLM)
+  static/         index.html, app.js, app.css; vendor/ holds marked + DOMPurify (pinned, integrity-checked)
+tests/            168 offline tests (DuckDB stands in for Snowflake, scripted LLM)
 evals/            live end-to-end cases (real Claude + Snowflake) + runner
 scripts/          snowflake_setup.sql, inspect_schema.py
 ```
+
+## Security and data handling
+
+**Access.**
+- Every page and API needs the login except `/healthz`, which says only `ok` or `degraded`. Operational detail (state location, proxy shape) is at `/api/status`, behind the login.
+- The password is checked in constant time.
+- After 10 wrong passwords from one IP within 10 minutes, that IP is locked out for 10 minutes, even if it then tries the right one. Requests without credentials don't count against it.
+
+**Browser hardening.**
+- The page loads nothing from third parties. Markdown rendering (`marked` 12.0.2) and HTML sanitising (`DOMPurify` 3.1.6) are served from `app/static/vendor/`; both were downloaded from the npm registry and checked against its published sha512 integrity hashes, with their licences alongside.
+- A Content-Security-Policy allows scripts, styles and requests only from the app itself, with no inline code and no framing. So even if sanitising ever failed, injected markup couldn't run.
+- Responses also carry `nosniff`, `X-Frame-Options: DENY`, `Referrer-Policy: no-referrer`, a restrictive `Permissions-Policy`, and HSTS.
+
+**The data and the model.** See the Key decisions above for SQL safety (parser allow-list, read-only role, timeouts) and prompt-injection defences (input classifier, output verifier, memory screening).
+
+**What leaves the app, and where data is kept:**
+| Data | Where it goes or is stored | How long |
+|---|---|---|
+| Your questions, the conversation, and query results | Sent to Anthropic's API to generate answers (Anthropic's data retention policy applies) | Per Anthropic's policy |
+| SQL the agent writes | Run in Snowflake as the read-only `CENSUS_READER` role; Snowflake keeps its normal query history | Snowflake's query-history retention |
+| Conversations and result tables | SQLite on the Render disk (`/var/data/state.db`), not encrypted by the app (Render's disk protection only) | Deleted after 30 days untouched, or by **New chat** |
+| Long-term memories (stated preferences) | Same SQLite file, keyed by a random per-browser ID | Until the user forgets them in the Memory panel |
+| Logs | Render's log stream: request IDs, outcomes, timings, the SQL run. Not your questions or answers, except where the verifier logs which claim it flagged | Render's log retention |
+
+The census data itself is public. The risk is what users *type*: anything personal in a question goes to Anthropic and into the conversation store. Memories reject contact details, but conversations store questions as asked. For a customer deployment I'd add a retention setting per tenant, encryption at rest with a managed key, and a "delete my data" endpoint covering conversations as well as memories.
+
+**What's still weak:** one shared demo password (no per-person accounts, no logout, no revoking one person). It's in git history too, so it should be changed after the review.
 
 ## Running locally
 
@@ -318,6 +345,7 @@ catalog load is retried every 30 s.
 **Operations notes.**
 - **Logs** are JSON on stdout. Each chat request has a `request_id`, returned in the `X-Request-ID` header and the final SSE event; filter on it to see one turn end to end (guardrail decision, each model step with its Anthropic request id, each SQL query, outcome and latency).
 - **Snowflake connection pool:** `SNOWFLAKE_POOL_SIZE` (default 4) caps concurrent queries. Keep it at or below the warehouse's concurrency level.
+- **Login lockout:** `LOGIN_FAILURES_PER_WINDOW` (10) and `LOGIN_LOCKOUT_S` (600).
 - **Rate limits** have three layers, all per rolling minute: 10 messages per browser session (so reviewers sharing an office IP don't block each other), 60 per IP (so a client can't get around the session limit by inventing session IDs), and 120 overall as a cost ceiling. Settings: `RATE_LIMIT_PER_SESSION_PER_MINUTE`, `RATE_LIMIT_PER_IP_PER_MINUTE`, `RATE_LIMIT_GLOBAL_PER_MINUTE`.
 - **State** (conversations, result tables, memories) is SQLite at `STATE_DB_PATH`; on Render that's `/var/data/state.db` on a 1 GB persistent disk declared in `render.yaml`. `/healthz` reports where state is kept, e.g. `"state": {"store": "file", "path": "/var/data/state.db", "on_mounted_volume": true}`. `on_mounted_volume: false` means the disk isn't attached and state will be lost on the next deploy; `"store": "memory"` means the file couldn't be opened, in which case the app keeps working and logs an error. Conversations untouched for 30 days are deleted at startup; memories are kept until the user deletes them.
 - **Client IPs for rate limiting** come from `X-Forwarded-For`, using only entries appended by the `TRUSTED_PROXY_HOPS` proxies in front of the app. On Render this is **2** (Cloudflare, then Render's load balancer; measured with `/healthz`, which reports the number of forwarded entries). Entries a client adds itself are ignored. On a new host, call `/healthz` directly and set the value to its `forwarded_for_entries`.

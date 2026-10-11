@@ -224,6 +224,14 @@ hardest:
 - **Comparing 2019 and 2020.** The agent always gives the overlap caveat, but
   it doesn't test whether a difference is statistically significant. Boundaries
   also change between releases, so it never matches block groups across years.
+- **One shared password.** The brief allows it, and failed logins are now
+  rate-limited, but there are no per-person accounts, no logout, and no way to
+  revoke one reviewer. It's also in the repo's git history, so it gets rotated
+  after the review.
+- **Conversations aren't encrypted by the app.** They sit in SQLite on the
+  Render disk, protected only by Render's own disk security, and they include
+  whatever users type. Fine for a demo on public data; a customer would need
+  encryption at rest and per-tenant retention.
 - **Both guardrails fail open.** If the classifier or the verifier errors or
   times out, the answer still goes out (unverified, and logged). I chose
   availability over strictness for a demo; a customer deployment might choose
@@ -249,7 +257,7 @@ I split testing by what each kind of test is good at:
 - **The agent loop's control flow, tested offline** with a scripted model.
 - **Answer quality, tested live** against real data.
 
-**Offline (161 tests, about 15 seconds, no credentials).** These cover:
+**Offline (168 tests, about 15 seconds, no credentials).** These cover:
 - the SQL validator against injection and escape attempts;
 - schema discovery, field search and place lookup, including ambiguous names;
 - the agent loop under failure: SQL errors, the database dropping mid-turn,

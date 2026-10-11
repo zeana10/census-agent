@@ -19,6 +19,7 @@ from typing import Any
 from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.security import HTTPBasic, HTTPBasicCredentials
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from . import export, logging_setup
@@ -94,6 +95,22 @@ class Runtime:
             return self.agent
 
 
+# Everything the page needs is served by this app: no CDNs, no inline scripts or styles, no framing.
+# A Content-Security-Policy this strict means injected markup can't run code even if sanitising failed.
+SECURITY_HEADERS = {
+    "Content-Security-Policy": (
+        "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; "
+        "font-src 'self'; object-src 'none'; base-uri 'none'; form-action 'self'; frame-ancestors 'none'"
+    ),
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "Referrer-Policy": "no-referrer",
+    "Permissions-Policy": "camera=(), microphone=(), geolocation=(), payment=()",
+    "Cross-Origin-Opener-Policy": "same-origin",
+    "Strict-Transport-Security": "max-age=31536000",
+}
+
+
 class ChatRequest(BaseModel):
     session_id: str | None = None
     client_id: str | None = None  # random id the browser keeps; scopes conversations and long-term memory
@@ -113,17 +130,17 @@ class RateLimiter:
         self.hits: dict[str, deque[float]] = defaultdict(deque)
         self._last_sweep = time.monotonic()
 
-    def _window(self, key: str, now: float) -> deque[float]:
+    def _window(self, key: str, now: float, window_s: float = 60) -> deque[float]:
         if now - self._last_sweep > 300:  # drop idle keys so memory doesn't grow without bound
-            self.hits = defaultdict(deque, {k: q for k, q in self.hits.items() if q and now - q[-1] <= 60})
+            self.hits = defaultdict(deque, {k: q for k, q in self.hits.items() if q and now - q[-1] <= 3600})
             self._last_sweep = now
         q = self.hits[key]
-        while q and now - q[0] > 60:
+        while q and now - q[0] > window_s:
             q.popleft()
         return q
 
-    def would_allow(self, key: str, now: float) -> bool:
-        return len(self._window(key, now)) < self.per_minute
+    def would_allow(self, key: str, now: float, window_s: float = 60) -> bool:
+        return len(self._window(key, now, window_s)) < self.per_minute
 
     def record(self, key: str, now: float) -> None:
         self._window(key, now).append(now)
@@ -208,44 +225,70 @@ def create_app(settings: Settings | None = None, *, runtime: Runtime | None = No
         warmup.cancel()
 
     app = FastAPI(title="Census Assistant", lifespan=lifespan, docs_url=None, redoc_url=None)
+    app.mount("/static", StaticFiles(directory=STATIC), name="static")
+
+    @app.middleware("http")
+    async def security_headers(request: Request, call_next: Any) -> Response:
+        response: Response = await call_next(request)
+        for k, v in SECURITY_HEADERS.items():
+            response.headers.setdefault(k, v)
+        return response
+
     basic = HTTPBasic(auto_error=False)
 
-    def require_auth(creds: HTTPBasicCredentials | None = Depends(basic)) -> None:
+    login_failures = RateLimiter(settings.login_failures_per_window)
+
+    def require_auth(request: Request, creds: HTTPBasicCredentials | None = Depends(basic)) -> None:
         if not settings.basic_auth_user:
             return
-        ok = (
-            creds is not None
-            and secrets.compare_digest(creds.username.encode(), settings.basic_auth_user.encode())
-            and secrets.compare_digest(creds.password.encode(), settings.basic_auth_password.encode())
+        if creds is None:  # the browser's first, credential-less request: just ask for the login
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Authentication required", headers={"WWW-Authenticate": "Basic"})
+        ip = client_ip(request, trusted_hops=settings.trusted_proxy_hops)
+        now = time.monotonic()
+        # Checked BEFORE the password, so a locked-out guesser learns nothing even if they hit the right one.
+        if not login_failures.would_allow(ip, now, window_s=settings.login_lockout_s):
+            log.warning("login locked out", extra={"tier": "login"})
+            raise HTTPException(
+                status.HTTP_429_TOO_MANY_REQUESTS,
+                "Too many failed sign-in attempts. Try again in a few minutes.",
+                headers={"Retry-After": str(settings.login_lockout_s)},
+            )
+        ok = secrets.compare_digest(creds.username.encode(), settings.basic_auth_user.encode()) and secrets.compare_digest(
+            creds.password.encode(), settings.basic_auth_password.encode()
         )
         if not ok:
+            login_failures.record(ip, now)
             raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Authentication required", headers={"WWW-Authenticate": "Basic"})
 
     @app.get("/healthz")
     async def healthz(request: Request) -> JSONResponse:
-        # Always 200 so the platform keeps the container up; "degraded" means the UI
-        # will explain that the database is unreachable instead of answering.
+        # Public and minimal: platforms poll it without credentials. Always 200 so the container is
+        # kept up; "degraded" means the database is unreachable (the UI explains that to users).
+        ready = request.app.state.runtime.agent is not None
+        return JSONResponse({"status": "ok" if ready else "degraded"})
+
+    @app.get("/api/status", dependencies=[Depends(require_auth)])
+    async def status_detail(request: Request) -> JSONResponse:
+        """Operational detail for whoever holds the login: why it's degraded, where state is kept,
+        and the proxy header shape used to choose TRUSTED_PROXY_HOPS on a new host."""
         rt: Runtime = request.app.state.runtime
         ready = rt.agent is not None
-        # Proxy shape (counts and header names only, never addresses), used to choose TRUSTED_PROXY_HOPS
-        # on a new host: if a direct request shows N forwarded entries, N proxies appended to the header.
         xff = [h for h in request.headers.get("x-forwarded-for", "").split(",") if h.strip()]
         client_ip_headers = sorted(h for h in ("true-client-ip", "cf-connecting-ip", "x-real-ip") if h in request.headers)
         return JSONResponse(
             {
                 "status": "ok" if ready else "degraded",
                 "detail": None if ready else "census catalog not loaded",
-                # Where conversations and memories are kept. "file" plus the path tells you whether that's the
-                # persistent disk (e.g. /var/data/...) or the container's own, wiped-on-deploy filesystem;
-                # "memory" means the file couldn't be opened (the app keeps working either way).
+                # "file" + on_mounted_volume=true: conversations and memories survive deploys.
+                # on_mounted_volume=false: the container's own filesystem, wiped on every deploy.
+                # "memory": the state file couldn't be opened (the app keeps working either way).
                 "state": {
                     "store": request.app.state.state_mode,
                     "path": settings.state_db_path,
-                    # True only when the database's folder is a mounted volume (e.g. a Render disk), i.e. it
-                    # survives deploys. False means the container's own filesystem: wiped on every deploy.
                     "on_mounted_volume": _on_mount(settings.state_db_path),
                 },
                 "proxy": {
+                    # Counts and header names only, never addresses: N entries means N proxies append.
                     "forwarded_for_entries": len(xff),
                     "client_ip_headers": client_ip_headers,
                     "trusted_proxy_hops": settings.trusted_proxy_hops,

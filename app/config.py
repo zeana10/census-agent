@@ -58,6 +58,8 @@ class Settings(BaseSettings):
     rate_limit_per_session_per_minute: int = 10
     rate_limit_per_ip_per_minute: int = 60
     rate_limit_global_per_minute: int = 120
+    login_failures_per_window: int = 10  # wrong passwords per IP before a lockout
+    login_lockout_s: int = 600  # ...within this window, which is also how long the lockout lasts
     # Number of reverse proxies in front of the app that append to X-Forwarded-For
     # (1 on Render/Fly/Cloud Run). 0 = ignore the header and use the socket peer.
     trusted_proxy_hops: int = 1

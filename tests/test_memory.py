@@ -274,13 +274,13 @@ def test_unwritable_state_path_degrades_instead_of_crashing(settings, warehouse,
     settings.state_db_path = str(blocker / "state.db")
     llm = ScriptedLLM(steps=[text_turn("still answering")])
     with _client(settings, warehouse, llm) as c:
-        assert c.get("/healthz").json()["state"]["store"] == "memory"
+        assert c.get("/api/status").json()["state"]["store"] == "memory"
         events = _sse(c.post("/api/chat", json={"client_id": ALICE, "message": "q"}).text)
         assert ("delta", {"text": "still answering"}) in events
 
 
 def test_healthz_reports_where_state_is_kept(settings, warehouse):
     with _client(settings, warehouse, ScriptedLLM()) as c:
-        state = c.get("/healthz").json()["state"]
+        state = c.get("/api/status").json()["state"]
         assert state["store"] == "file" and state["path"] == settings.state_db_path
         assert isinstance(state["on_mounted_volume"], bool)
