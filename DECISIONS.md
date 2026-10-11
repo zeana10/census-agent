@@ -309,7 +309,10 @@ The decisions behind it:
   service, and it fits an app that already runs as one instance. The trade-off
   is a few seconds of downtime per deploy. If the disk can't be opened, the app
   falls back to in-memory state and says so on `/healthz`, rather than failing
-  to start.
+  to start. My first version of that check reported "durable" whenever a file
+  opened, and it said so on Render before the disk was even attached (the file
+  was on the container's own, wiped-on-deploy filesystem). It now reports the
+  path, so you can see whether it's really on the disk.
 - **Memory is an attack surface.** Saved notes are shown to the model on every
   future turn, so they're an obvious place to plant instructions ("memory
   poisoning"). My defences:

@@ -234,9 +234,10 @@ def create_app(settings: Settings | None = None, *, runtime: Runtime | None = No
             {
                 "status": "ok" if ready else "degraded",
                 "detail": None if ready else "census catalog not loaded",
-                # "durable" = conversations and memories are on disk; "ephemeral" = the state file couldn't be
-                # opened, so they're held in memory and lost on restart (the app keeps working either way).
-                "state": request.app.state.state_mode,
+                # Where conversations and memories are kept. "file" plus the path tells you whether that's the
+                # persistent disk (e.g. /var/data/...) or the container's own, wiped-on-deploy filesystem;
+                # "memory" means the file couldn't be opened (the app keeps working either way).
+                "state": {"store": request.app.state.state_mode, "path": settings.state_db_path},
                 "proxy": {
                     "forwarded_for_entries": len(xff),
                     "client_ip_headers": client_ip_headers,
@@ -395,10 +396,10 @@ def _open_store(path: str) -> tuple[StateStore, str]:
     """Open the durable store, or fall back to an in-memory one rather than failing to start.
     A missing or read-only disk should cost us persistence, not the whole service."""
     try:
-        return StateStore(path), "durable"
+        return StateStore(path), "file"
     except (OSError, sqlite3.Error) as e:
         log.error("state store at %s unavailable (%s); using in-memory state until fixed", path, e)
-        return StateStore(":memory:"), "ephemeral"
+        return StateStore(":memory:"), "memory"
 
 
 def _table_event(session_id: str, table_id: str, t: ResultTable, max_rows: int) -> dict[str, Any]:
